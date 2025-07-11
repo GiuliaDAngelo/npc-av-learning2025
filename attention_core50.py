@@ -37,6 +37,8 @@ device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 config = Config()
 
 path_data = '/Users/giuliadangelo/workspace/data/DATASETs/core50/350x350evframes/'
+
+
 scenario = natsorted([d for d in os.listdir(path_data) if os.path.isdir(os.path.join(path_data, d))])
 max_x, max_y = 350, 350
 resolution = (max_y, max_x)
@@ -56,6 +58,10 @@ for scenario_i in scenario:
             img_path = os.path.join(obj_path_data, data_file_i)
             img = Image.open(img_path)
             window = transform(img).unsqueeze(0).squeeze(1)
+            vals, counts = torch.unique(window, return_counts=True)
+            max_mode = vals[torch.argmax(counts)]
+            window = torch.where(window == max_mode, torch.tensor(0.0, device=window.device),
+                                 torch.tensor(255.0, device=window.device))
 
             saliency_map[:], salmax_coords[:] = run_attention(
                 window, net_attention, device, resolution, config.ATTENTION_PARAMS['num_pyr']
@@ -89,7 +95,7 @@ for scenario_i in scenario:
             window_img_boxed = mask
 
             # --- Concatenate and show ---
-            saliency_map_color = cv2.cvtColor(saliency_map.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+            saliency_map_color = cv2.applyColorMap(saliency_map.astype(np.uint8), cv2.COLORMAP_JET)
             combined = np.hstack((saliency_map_color, window_img_boxed))
             cv2.imshow('Saliency (left) & Events in Box (right)', combined)
             cv2.waitKey(1)
