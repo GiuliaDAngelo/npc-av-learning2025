@@ -10,9 +10,20 @@ import torchvision.transforms as T
 import matplotlib
 matplotlib.use('Agg')  # Use Agg backend (no GUI)
 import matplotlib.pyplot as plt
+from training import CLIPEventClassifier  # remove if you are not training
 
 import sspspace
 from transformers import CLIPProcessor, CLIPModel
+
+import torchvision.transforms as transforms
+
+event_transform = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.Grayscale(num_output_channels=3),
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5]*3, [0.5]*3)
+])
 
 
 transform = T.Compose([
@@ -53,17 +64,20 @@ class Config:
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 config = Config()
 
-path_data = '/Users/giuliadangelo/Downloads/npc-av-learning/CRIB/evframes/'
+
+bbox_savingFLAG = False
+root = '/Users/giuliadangelo/Downloads/npc-av-learning/CRIB/train_data/'
+path_data = root+'evframes/'
 objects = natsorted([d for d in os.listdir(path_data) if os.path.isdir(os.path.join(path_data, d))])
 
 for obj in objects:
     print(obj)
     #sensor
-    max_x, max_y = 200, 200
+    max_x, max_y = 400, 400
     resolution = (max_y, max_x)
-    box_size = 150
+    box_size = 350
     #oms
-    size_krn_after_oms = 193
+    size_krn_after_oms = 393
     OMS = np.zeros((size_krn_after_oms, size_krn_after_oms), dtype=np.float32)
     vSliceOMS = torch.zeros((1, size_krn_after_oms, size_krn_after_oms), dtype=torch.float32).to(device)
     #saliency map
@@ -72,10 +86,16 @@ for obj in objects:
     #encoder
     coord_encoder = sspspace.RandomSSPSpace(domain_dim=2, ssp_dim=512)
 
+    # clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
+    # clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    # clip_model.eval()
 
-    clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-    clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    clip_model.eval()
+    NUM_CLASSES = 17  # Set to number of categories you trained on
+    model_path = "clip_event_classifier.pth"
+
+    event_clip_model = CLIPEventClassifier(num_classes=NUM_CLASSES).to(device)
+    event_clip_model.load_state_dict(torch.load(model_path, map_location=device))
+    event_clip_model.eval()
 
     net_center, net_surround = initialize_oms(device, config.OMS_PARAMS)
     net_attention = initialise_attention(device, config.ATTENTION_PARAMS)
@@ -83,6 +103,8 @@ for obj in objects:
     data_files = natsorted([f for f in os.listdir(obj_path_data) if os.path.isfile(os.path.join(obj_path_data, f))])
 
     object_memory = coord_encoder.encode([[0, 0]])
+    bbox_saving_path = root + 'bbox/'
+    os.mkdir(bbox_saving_path+obj) if not os.path.exists(bbox_saving_path + obj) else None
     for data_file_i in data_files:
         img_path = os.path.join(obj_path_data, data_file_i)
 
@@ -138,11 +160,29 @@ for obj in objects:
         window_img_boxed = mask
 
         roi_center = coord_encoder.encode([[x, y]])
-        current_roi = clip_processor(images=[window_img_color[y1:y2, x1:x2]], return_tensors="pt", padding=True).to(device)
-        with torch.no_grad():
-            image_features = clip_model.get_image_features(**current_roi)
 
-        img_feat_ssp = sspspace.SSP(image_features.cpu().numpy())
+        if bbox_savingFLAG:
+            name_file = data_file_i.split('.png')[0]
+            save_path = os.path.join(bbox_saving_path+obj, f"{name_file}_bbox.png")
+            save_img = np.zeros((box_size, box_size), dtype=np.uint8)
+            crop = window_img[y1:y2, x1:x2]
+            h, w = crop.shape[:2]
+            save_img[:h, :w] = crop
+            cv2.imwrite(save_path, save_img)
+
+        # current_roi = clip_processor(images=[window_img_color[y1:y2, x1:x2]], return_tensors="pt", padding=True).to(device)
+        # with torch.no_grad():
+        #     image_features = clip_model.get_image_features(**current_roi)
+
+        roi_crop = window_img_color[y1:y2, x1:x2]
+        roi_tensor = event_transform(roi_crop).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            image_features = event_clip_model.clip.get_image_features(pixel_values=roi_tensor)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)  # L2-normalize
+            image_features_np = image_features.cpu().numpy()  # ✅ numpy array of shape (1, 512)
+
+        img_feat_ssp = sspspace.SSP(image_features_np)
         new_roi = roi_center * img_feat_ssp
         gamma = 0.99 # 0.99 for bbox
         object_memory = gamma * object_memory + (1 - gamma) * new_roi

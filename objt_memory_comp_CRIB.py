@@ -1,145 +1,125 @@
-import os
-import glob
+import torch
+import torch.nn as nn
+from transformers import CLIPModel, CLIPProcessor
+from PIL import Image
 import numpy as np
+import os
+import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
-from scipy.spatial.distance import cdist, cosine
-import matplotlib
-from transformers import CLIPProcessor, CLIPModel
+import seaborn as sns
+from training import CLIPEventClassifier  # ensure this is accessible
 
+# ======= CONFIG =======
+device = torch.device("mps" if torch.backends.mps.is_available()
+                      else "cuda" if torch.cuda.is_available()
+                      else "cpu")
 
-matplotlib.use('Agg')
+bbox_dir = "/Users/giuliadangelo/Downloads/npc-av-learning/CRIB/train_data/bbox/"
+model_path = "clip_event_classifier.pth"
 
-# === Optional ML tools ===
-from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans
+# ======= TEXT LABELS =======
+text_labels = [
+    "bow", "baby", "balls", "basketball", "bee", "bike_helmet", "birdie",
+    "bulb", "bunny", "comb", "cookie", "dog", "dolphin", "doraemon",
+    "film_clapper", "fork", "fox"
+]
+text_labels = np.array(text_labels).flatten()
+text_labels_list = ["a photo of a " + t for t in text_labels]
+num_classes = len(text_labels)
 
-# === Setup ===
-data_dir = '/Users/giuliadangelo/Downloads/npc-av-learning/CRIB/workingmemory/'
-output_dir = 'analysis/CRIB'
-os.makedirs(output_dir, exist_ok=True)
-
-# === === ======
-# === Memory ===
-# === === ======
-
-
-clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+# ======= Load CLIP text embeddings =======
+clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 clip_model.eval()
 
-# === Load all object memory vectors ===
-filenames = glob.glob(os.path.join(data_dir, '*memory.npy'))
+text_tokens = clip_processor(text=text_labels_list, return_tensors="pt", padding=True).to(device)
+with torch.no_grad():
+    text_embeddings = clip_model.get_text_features(**text_tokens)
+    text_embeddings = text_embeddings / text_embeddings.norm(p=2, dim=-1, keepdim=True)
 
-if not filenames:
-    raise FileNotFoundError("❌ No memory files found!")
+# ======= Load your fine-tuned model (for image embedding) =======
+event_clip_model = CLIPEventClassifier(num_classes=num_classes).to(device)
+event_clip_model.load_state_dict(torch.load(model_path, map_location=device))
+event_clip_model.eval()
 
-object_vectors = []
-for f in filenames:
-    arr = np.load(f)
-    if arr.size > 0:
-        arr = arr.squeeze()
-        if arr.ndim == 1:
-            arr = arr[np.newaxis, :]
-        object_vectors.append(arr)
-    else:
-        print(f"⚠️ Empty array in file: {f}")
+# Use just the image encoder
+def get_image_features(model, image_tensor):
+    with torch.no_grad():
+        img_feat = model.clip.get_image_features(pixel_values=image_tensor)
+        return img_feat / img_feat.norm(dim=-1, keepdim=True)
 
-data = np.vstack(object_vectors)
-n_objects, feature_dim = data.shape
-print(f"✅ Loaded {n_objects} objects with vector size {feature_dim}")
+# ======= Preprocessing (same as training) =======
+transform = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.Grayscale(num_output_channels=3),
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5]*3, [0.5]*3)
+])
 
-# === Cosine Similarity Matrix Between All Pairs ===
-cosine_sim_matrix = 1 - cdist(data, data, metric='cosine')
+# ======= Evaluation and Confusion Matrix Collection =======
+acc = 0
+total = 0
+similarity_matrix = torch.zeros((num_classes, num_classes), dtype=torch.float32)
 
-plt.figure(figsize=(8, 7))
-plt.imshow(cosine_sim_matrix, interpolation='none', cmap='viridis')
-plt.colorbar(label='Cosine Similarity')
-plt.title('Pairwise Cosine Similarity Between Objects')
-plt.xlabel('Object Index')
-plt.ylabel('Object Index')
+for i, label in enumerate(text_labels):
+    label_dir = os.path.join(bbox_dir, label)
+    if not os.path.exists(label_dir):
+        print(f"Missing directory for label: {label}")
+        continue
+
+    crop_files = [f for f in os.listdir(label_dir) if f.endswith(".png")]
+    if len(crop_files) == 0:
+        print(f"No crops for label: {label}")
+        continue
+
+    embeddings = []
+
+    for crop_file in crop_files:
+        crop_path = os.path.join(label_dir, crop_file)
+        image = Image.open(crop_path).convert("L")
+        image_tensor = transform(np.array(image)).unsqueeze(0).to(device)
+
+        embedding = get_image_features(event_clip_model, image_tensor)
+        embeddings.append(embedding.squeeze(0))  # shape: [512]
+
+    if len(embeddings) == 0:
+        print(f"No valid embeddings for label: {label}")
+        continue
+
+    # Average all embeddings for the class
+    avg_embedding = torch.stack(embeddings).mean(dim=0)
+    avg_embedding = avg_embedding / avg_embedding.norm()
+    avg_embedding = avg_embedding.unsqueeze(1)  # shape: [512, 1]
+
+    # Similarity to all text embeddings
+    scores = torch.matmul(text_embeddings, avg_embedding).squeeze()  # shape: [num_classes]
+    similarity_matrix[i, :] = scores  # Row = true label, Columns = scores to each text label
+
+    # Predicted class
+    pred_idx = torch.argmax(scores).item()
+    pred = text_labels[pred_idx]
+
+    print(f"Label: {label} → Predicted: {pred}")
+    if pred == label:
+        acc += 1
+    total += 1
+
+# ======= Final accuracy =======
+if total > 0:
+    print(f"\nAccuracy: {acc / total:.3f} ({acc}/{total})")
+else:
+    print("No valid crops found for any label.")
+
+# ======= Save Confusion Matrix (as heatmap of similarities) =======
+similarity_matrix_np = similarity_matrix.cpu().numpy()
+
+plt.figure(figsize=(14, 10))
+sns.heatmap(similarity_matrix_np, xticklabels=text_labels, yticklabels=text_labels,
+            cmap="viridis", annot=True, fmt=".2f", cbar_kws={"label": "Cosine Similarity"})
+plt.xlabel("Text Embedding")
+plt.ylabel("True Object Class (Avg Image Embedding)")
+plt.title("CLIP Similarity Matrix")
 plt.tight_layout()
-plt.savefig(os.path.join(output_dir, 'cosine_similarity_matrix.png'))
-plt.close()
-
-# === Similarity to Average Vector ===
-average_vector = np.mean(data, axis=0)
-cosine_to_avg = np.array([1 - cosine(obj, average_vector) for obj in data])
-
-plt.figure(figsize=(8, 5))
-plt.plot(range(n_objects), cosine_to_avg, marker='o', linestyle='-', color='navy')
-plt.xlabel('Object Index')
-plt.ylabel('Cosine Similarity to Average')
-plt.title('Similarity of Each Object to Average Memory Vector')
-plt.grid(True)
-plt.tight_layout()
-plt.savefig(os.path.join(output_dir, 'cosine_to_average.png'))
-plt.close()
-
-# === Histogram: Distribution of Similarities to Average ===
-plt.figure(figsize=(6, 4))
-plt.hist(cosine_to_avg, bins=20, color='purple', edgecolor='black')
-plt.xlabel('Cosine Similarity to Average')
-plt.ylabel('Count')
-plt.title('Distribution of Cosine Similarity to Average')
-plt.tight_layout()
-plt.savefig(os.path.join(output_dir, 'hist_cosine_to_average.png'))
-plt.close()
-
-# === PCA: Visualize Memory Space in 2D ===
-pca = PCA(n_components=2)
-pca_result = pca.fit_transform(data)
-
-plt.figure(figsize=(6, 5))
-plt.scatter(pca_result[:, 0], pca_result[:, 1], c=cosine_to_avg, cmap='viridis', edgecolor='k')
-plt.colorbar(label='Cosine Similarity to Avg')
-plt.title('PCA of Memory Vectors (colored by similarity to avg)')
-plt.tight_layout()
-plt.savefig(os.path.join(output_dir, 'pca_cosine_colored.png'))
-plt.close()
-
-# === Elbow Method: Determine optimal number of clusters ===
-inertias = []
-k_range = range(1, 15)
-for k in k_range:
-    km = KMeans(n_clusters=k, random_state=42)
-    km.fit(data)
-    inertias.append(km.inertia_)
-
-plt.figure(figsize=(6, 4))
-plt.plot(k_range, inertias, marker='o')
-plt.xlabel('Number of Clusters (k)')
-plt.ylabel('Inertia')
-plt.title('Elbow Method for Optimal k')
-plt.tight_layout()
-plt.savefig(os.path.join(output_dir, 'elbow_plot.png'))
-plt.close()
-
-# === KMeans Clustering (e.g., with k=3 for now) ===
-n_clusters = 14
-kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-labels = kmeans.fit_predict(data)
-
-plt.figure(figsize=(6, 5))
-plt.scatter(pca_result[:, 0], pca_result[:, 1], c=labels, cmap='tab10', edgecolor='k')
-plt.title(f'KMeans Clustering (k={n_clusters}) on Memory Vectors')
-plt.tight_layout()
-plt.savefig(os.path.join(output_dir, 'pca_kmeans_clusters.png'))
-plt.close()
-
-# === Sorted Similarity Matrix by Similarity to Average ===
-sorted_indices = np.argsort(-cosine_to_avg)
-sorted_sim_matrix = cosine_sim_matrix[sorted_indices][:, sorted_indices]
-
-plt.figure(figsize=(8, 7))
-plt.imshow(sorted_sim_matrix, interpolation='none', cmap='viridis')
-plt.colorbar(label='Cosine Similarity')
-plt.title('Pairwise Cosine Similarity (Sorted by Similarity to Avg)')
-plt.xlabel('Sorted Object Index')
-plt.ylabel('Sorted Object Index')
-plt.tight_layout()
-plt.savefig(os.path.join(output_dir, 'cosine_matrix_sorted.png'))
-plt.close()
-
-print("✅ All analyses completed and visualizations saved.")
-
-
+plt.savefig("confusion_similarity_matrix.png", dpi=300)
+print("Confusion matrix saved to: confusion_similarity_matrix.png")

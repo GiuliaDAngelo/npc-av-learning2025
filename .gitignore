@@ -2,3 +2,5 @@ __pycache__/
 .DS_Store
 .idea/
 analysis/
+clip_event_classifier.pth
+confusion_similarity_matrix.png
