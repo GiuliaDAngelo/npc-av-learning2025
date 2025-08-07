@@ -1,105 +1,246 @@
 import torch
-import torch.nn as nn
-from transformers import CLIPModel, CLIPProcessor
-from PIL import Image
 import numpy as np
 import os
-import torchvision.transforms as transforms
-from training import CLIPEventClassifier  # Make sure this class is defined and matches your trained model
+import json
+import matplotlib.pyplot as plt
+from PIL import Image
+from load_model import EmbeddingExtractor
 
 # ======= CONFIG =======
 device = torch.device("mps" if torch.backends.mps.is_available()
                       else "cuda" if torch.cuda.is_available()
-                      else "cpu")
+else "cpu")
 
 bbox_dir = "/Users/giuliadangelo/Downloads/npc-av-learning/CRIB/train_data/bbox/"
-model_path = "clip_event_classifier.pth"
 
-# ======= TEXT LABELS =======
-text_labels = [
-    "bow", "baby", "balls", "basketball", "bee", "bike_helmet", "birdie",
-    "bulb", "bunny", "comb", "cookie", "dog", "dolphin", "doraemon",
-    "film_clapper", "fork", "fox"
-]
-text_labels = np.array(text_labels).flatten()
-text_labels_list = ["a photo of a " + t for t in text_labels]
 
-# ======= Load CLIP text embeddings =======
-clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
-clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-clip_model.eval()
+def get_model_classes():
+    """Get the actual classes the model was trained on"""
+    try:
+        training_info_path = "autoencoder-classifier-trained/training_info.json"
+        if os.path.exists(training_info_path):
+            with open(training_info_path, 'r') as f:
+                training_info = json.load(f)
+            model_classes = training_info.get('class_names', [])
+            print(f"✅ Found model classes from training info: {model_classes}")
+            return model_classes
+        else:
+            print("⚠️ Training info not found, getting classes from directory structure")
+    except Exception as e:
+        print(f"⚠️ Error reading training info: {e}")
 
-text_tokens = clip_processor(text=text_labels_list, return_tensors="pt", padding=True).to(device)
-with torch.no_grad():
-    text_embeddings = clip_model.get_text_features(**text_tokens)
-    text_embeddings = text_embeddings / text_embeddings.norm(p=2, dim=-1, keepdim=True)
+    # Fallback: get from directory structure
+    model_classes = sorted([d for d in os.listdir(bbox_dir)
+                            if os.path.isdir(os.path.join(bbox_dir, d)) and not d.startswith('.')])
+    print(f"📁 Using classes from directory: {model_classes}")
+    return model_classes
 
-# ======= Load your fine-tuned model (for image embedding) =======
-event_clip_model = CLIPEventClassifier(num_classes=len(text_labels)).to(device)
-event_clip_model.load_state_dict(torch.load(model_path, map_location=device))
-event_clip_model.eval()
 
-# Use just the image encoder (without classifier)
-def get_image_features(model, image_tensor):
-    with torch.no_grad():
-        img_feat = model.clip.get_image_features(pixel_values=image_tensor)
-        return img_feat / img_feat.norm(dim=-1, keepdim=True)
+def evaluate_model_simple():
+    """Simple evaluation focusing on classification accuracy"""
 
-# ======= Preprocessing (same as training) =======
-transform = transforms.Compose([
-    transforms.ToPILImage(),
-    transforms.Grayscale(num_output_channels=3),
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.5]*3, [0.5]*3)
-])
+    print(f"🚀 SIMPLE MODEL EVALUATION")
+    print(f"Using device: {device}")
 
-# ======= Evaluation =======
-acc = 0
-total = 0
+    # Load model
+    try:
+        model = EmbeddingExtractor()
+        print("✅ EmbeddingExtractor loaded successfully")
+    except Exception as e:
+        print(f"❌ Error loading model: {e}")
+        return
 
-for label in text_labels:
-    label_dir = os.path.join(bbox_dir, label)
-    if not os.path.exists(label_dir):
-        print(f"Missing directory for label: {label}")
-        continue
+    # Get classes
+    class_names = get_model_classes()
+    print(f"📋 Found {len(class_names)} classes: {class_names}")
 
-    crop_files = [f for f in os.listdir(label_dir) if f.endswith(".png")]
-    if len(crop_files) == 0:
-        print(f"No crops for label: {label}")
-        continue
+    if len(class_names) == 0:
+        print("❌ No classes found!")
+        return
 
-    embeddings = []
+    # Collect embeddings and calculate class centroids
+    print(f"\n🔍 STEP 1: Computing class centroids...")
+    class_centroids = {}
+    class_stats = {}
 
-    for crop_file in crop_files:
-        crop_path = os.path.join(label_dir, crop_file)
-        image = Image.open(crop_path).convert("L")
-        image_tensor = transform(np.array(image)).unsqueeze(0).to(device)
+    for class_name in class_names:
+        class_dir = os.path.join(bbox_dir, class_name)
+        if not os.path.exists(class_dir):
+            print(f"❌ Missing directory for class: {class_name}")
+            continue
 
-        embedding = get_image_features(event_clip_model, image_tensor)
-        embeddings.append(embedding.squeeze(0))  # shape: [512]
+        # Get image files
+        image_files = [f for f in os.listdir(class_dir)
+                       if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
 
-    if len(embeddings) == 0:
-        print(f"No valid embeddings for label: {label}")
-        continue
+        if len(image_files) == 0:
+            print(f"⚠️ No images found for class: {class_name}")
+            continue
 
-    # Average all embeddings
-    avg_embedding = torch.stack(embeddings).mean(dim=0)
-    avg_embedding = avg_embedding / avg_embedding.norm()
-    avg_embedding = avg_embedding.unsqueeze(1)  # shape: [512, 1]
+        # Sample up to 30 images per class for speed
+        sample_size = min(30, len(image_files))
+        sampled_files = np.random.choice(image_files, sample_size, replace=False)
 
-    # Compute similarity between avg_embedding and all text embeddings
-    scores = torch.matmul(text_embeddings, avg_embedding).squeeze()  # shape: [num_labels]
-    pred_idx = torch.argmax(scores).item()
-    pred = text_labels[pred_idx]
+        embeddings = []
+        processed = 0
+        errors = 0
 
-    print(f"Label: {label} → Predicted: {pred}")
-    if pred == label:
-        acc += 1
-    total += 1
+        print(f"   Processing {class_name}... ", end="")
 
-# ======= Final accuracy =======
-if total > 0:
-    print(f"\nAccuracy: {acc / total:.3f} ({acc}/{total})")
-else:
-    print("No valid crops found for any label.")
+        for img_file in sampled_files:
+            img_path = os.path.join(class_dir, img_file)
+            try:
+                image = Image.open(img_path).convert("RGB")
+                image_array = np.array(image)
+                embedding = model.get_embeddings(image_array)
+                embedding = embedding / (np.linalg.norm(embedding) + 1e-8)
+                embeddings.append(embedding)
+                processed += 1
+            except Exception as e:
+                errors += 1
+
+        if len(embeddings) > 0:
+            embeddings = np.array(embeddings)
+            centroid = np.mean(embeddings, axis=0)
+            class_centroids[class_name] = centroid
+            class_stats[class_name] = {
+                'embeddings': embeddings,
+                'processed': processed,
+                'errors': errors,
+                'total_files': len(image_files)
+            }
+            print(f"✅ {processed} images processed (errors: {errors})")
+        else:
+            print(f"❌ No valid embeddings")
+
+    if len(class_centroids) < 2:
+        print("❌ Not enough classes with valid data!")
+        return
+
+    # Evaluate classification accuracy
+    print(f"\n🎯 STEP 2: Testing classification accuracy...")
+
+    class_accuracies = {}
+    total_correct = 0
+    total_samples = 0
+
+    for true_class, stats in class_stats.items():
+        if true_class not in class_centroids:
+            continue
+
+        embeddings = stats['embeddings']
+        correct = 0
+
+        for embedding in embeddings:
+            # Find nearest centroid
+            min_distance = float('inf')
+            predicted_class = None
+
+            for centroid_class, centroid in class_centroids.items():
+                distance = np.linalg.norm(embedding - centroid)
+                if distance < min_distance:
+                    min_distance = distance
+                    predicted_class = centroid_class
+
+            if predicted_class == true_class:
+                correct += 1
+                total_correct += 1
+            total_samples += 1
+
+        accuracy = correct / len(embeddings) if len(embeddings) > 0 else 0
+        class_accuracies[true_class] = accuracy
+        print(f"   {true_class:15s}: {accuracy:.3f} ({correct}/{len(embeddings)})")
+
+    overall_accuracy = total_correct / total_samples if total_samples > 0 else 0
+
+    # Create the most important visualization: Classification Accuracy
+    print(f"\n📊 STEP 3: Creating accuracy visualization...")
+
+    plt.figure(figsize=(8, 8))
+
+    # Main plot: Per-class accuracy
+    classes = list(class_accuracies.keys())
+    accuracies = list(class_accuracies.values())
+
+    # Color bars based on performance
+    colors = ['green' if acc > 0.8 else 'orange' if acc > 0.6 else 'red' for acc in accuracies]
+
+    bars = plt.bar(range(len(classes)), accuracies, color=colors, alpha=0.7, width=0.2)
+    plt.xticks(range(len(classes)), classes, rotation=45, ha='right', fontsize=20)
+    plt.ylabel('Accuracy', fontsize=20)
+    plt.title(f'Per-Class Classification Accuracy\nOverall: {overall_accuracy:.3f} ({total_correct}/{total_samples})')
+    plt.ylim(0, 1)
+
+    # Add accuracy labels on bars
+    for i, (bar, acc) in enumerate(zip(bars, accuracies)):
+        plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                 f'{acc:.2f}', ha='center', va='bottom', fontsize=15)
+
+    # Add horizontal line at 80% (good performance threshold)
+    plt.axhline(y=0.8, color='green', linestyle='--', alpha=0.5, label='Good Performance (80%)')
+    plt.axhline(y=0.6, color='orange', linestyle='--', alpha=0.5, label='Fair Performance (60%)')
+    plt.legend()
+
+    # # Bottom plot: Sample sizes
+    # plt.subplot(2, 1, 2)
+    # sample_counts = [class_stats[cls]['processed'] for cls in classes]
+    # plt.bar(range(len(classes)), sample_counts, alpha=0.7, color='skyblue')
+    # plt.xticks(range(len(classes)), classes, rotation=45, ha='right', fontsize=20)
+    # plt.ylabel('Samples Used', fontsize=20)
+    # plt.title('Number of Samples per Class')
+
+    plt.tight_layout()
+    plt.savefig('model_accuracy_analysis.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    # ======= FINAL ASSESSMENT =======
+    print(f"\n{'=' * 60}")
+    print("🎯 FINAL ASSESSMENT")
+    print(f"{'=' * 60}")
+
+    print(f"📊 Overall Accuracy: {overall_accuracy:.3f} ({total_correct}/{total_samples})")
+
+    # Performance assessment
+    if overall_accuracy > 0.8:
+        print("   🟢 EXCELLENT: Model has learned very well!")
+        verdict = "EXCELLENT"
+    elif overall_accuracy > 0.6:
+        print("   🟡 GOOD: Model has learned reasonably well")
+        verdict = "GOOD"
+    elif overall_accuracy > 0.4:
+        print("   🟠 FAIR: Model has learned somewhat, but needs improvement")
+        verdict = "FAIR"
+    else:
+        print("   🔴 POOR: Model has not learned well, consider retraining")
+        verdict = "POOR"
+
+    # Class-specific insights
+    best_classes = [cls for cls, acc in class_accuracies.items() if acc > 0.8]
+    worst_classes = [cls for cls, acc in class_accuracies.items() if acc < 0.5]
+
+    if best_classes:
+        print(f"   🏆 Best learned classes: {', '.join(best_classes)}")
+    if worst_classes:
+        print(f"   ⚠️ Poorly learned classes: {', '.join(worst_classes)}")
+
+    # Save simple results
+    simple_results = {
+        'overall_accuracy': overall_accuracy,
+        'verdict': verdict,
+        'class_accuracies': class_accuracies,
+        'total_samples': total_samples,
+        'best_classes': best_classes,
+        'worst_classes': worst_classes
+    }
+
+    with open('simple_model_evaluation.json', 'w') as f:
+        json.dump(simple_results, f, indent=2)
+
+    print("✅ Results saved to 'simple_model_evaluation.json'")
+    print("✅ Chart saved to 'model_accuracy_analysis.png'")
+
+    return simple_results
+
+
+if __name__ == "__main__":
+    results = evaluate_model_simple()
