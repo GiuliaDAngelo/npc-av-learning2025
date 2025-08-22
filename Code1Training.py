@@ -17,11 +17,13 @@ device = torch.device("mps" if torch.backends.mps.is_available()
                       else "cuda" if torch.cuda.is_available()
 else "cpu")
 
-data_root = "/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/bboxes/"
-results_dir = "/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/resultsbbox30050epochs/"
+
+DATA_ROOT = '/media/matt/bigdata/DATA/CRIB/bboxes/'
+RESULTS_DIR = '/media/matt/bigdata/DATA/CRIB/resultsbbox30050epochs/'
 
 batch_size = 32
 num_epochs = 1 #50 #we already tried with 8
+num_epochs = 1 #we already tried with 8
 lr = 1e-3 #1e-3
 weight_decay = 1e-4
 # New parameters for autoencoder
@@ -255,7 +257,7 @@ def visualize_reconstructions(model, val_loader, device, num_samples=8):
         axes[1, i].axis('off')
 
     plt.tight_layout()
-    plt.savefig(results_dir+'reconstruction_samples.png', dpi=150, bbox_inches='tight')
+    plt.savefig(RESULTS_DIR+'reconstruction_samples.png', dpi=150, bbox_inches='tight')
     plt.close()
 
 
@@ -271,15 +273,15 @@ def train_model():
     print(f"✓ Using {input_channels} input channel for event frames")
 
     # Get class names
-    class_names = sorted([d for d in os.listdir(data_root)
-                          if os.path.isdir(os.path.join(data_root, d)) and not d.startswith('.')])
+    class_names = sorted([d for d in os.listdir(DATA_ROOT)
+                          if os.path.isdir(os.path.join(DATA_ROOT, d)) and not d.startswith('.')])
     print(f"Found {len(class_names)} classes: {class_names}")
 
     class_to_idx = {class_name: idx for idx, class_name in enumerate(class_names)}
 
     # Create datasets
-    train_dataset = EventDataset(data_root, class_to_idx, transform=get_event_transforms(train=True))
-    val_dataset = EventDataset(data_root, class_to_idx, transform=get_event_transforms(train=False))
+    train_dataset = EventDataset(DATA_ROOT, class_to_idx, transform=get_event_transforms(train=True))
+    val_dataset = EventDataset(DATA_ROOT, class_to_idx, transform=get_event_transforms(train=False))
 
     # Split dataset
     train_size = int(0.8 * len(train_dataset))
@@ -378,7 +380,7 @@ def train_model():
                 'epoch': epoch,
                 'embedding_dim': embedding_dim,
                 # add other metadata as needed
-            }, os.path.join(results_dir, "best_autoencoder.pth"))
+            }, os.path.join(RESULTS_DIR, "best_autoencoder.pth"))
             print(f"  ✅ New best model saved! Val Recon Loss: {avg_val_recon_loss:.4f}")
             visualize_reconstructions(model, val_loader, device)
         else:
@@ -388,7 +390,7 @@ def train_model():
                 break
 
     # Final evaluation
-    checkpoint = torch.load(os.path.join(results_dir, "best_autoencoder.pth"))
+    checkpoint = torch.load(os.path.join(RESULTS_DIR, "best_autoencoder.pth"))
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
@@ -402,15 +404,15 @@ def train_model():
             all_embeddings.extend(embeddings.cpu().numpy())
 
     # Save final model and embeddings
-    os.makedirs(results_dir+"autoencoder-trained", exist_ok=True)
-    torch.save(model.state_dict(), results_dir+"autoencoder-trained/model.pth")
+    os.makedirs(RESULTS_DIR+"autoencoder-trained", exist_ok=True)
+    torch.save(model.state_dict(), RESULTS_DIR+"autoencoder-trained/model.pth")
 
     # Save embeddings
-    np.save(results_dir+"autoencoder-trained/embeddings.npy", np.array(all_embeddings))
-    np.save(results_dir+"autoencoder-trained/labels.npy", np.array(all_labels))
+    np.save(RESULTS_DIR+"autoencoder-trained/embeddings.npy", np.array(all_embeddings))
+    np.save(RESULTS_DIR+"autoencoder-trained/labels.npy", np.array(all_labels))
 
     # Save training info with updated metadata
-    with open(os.path.join(results_dir, "autoencoder-trained/training_info.json"), "w") as f:
+    with open(os.path.join(RESULTS_DIR, "autoencoder-trained/training_info.json"), "w") as f:
         json.dump({
             "num_epochs": num_epochs,
             "batch_size": batch_size,
@@ -432,7 +434,7 @@ def train_model():
     plt.legend()
 
     plt.tight_layout()
-    plt.savefig(results_dir+'autoencoder-trained/training_curves.png', dpi=150, bbox_inches='tight')
+    plt.savefig(RESULTS_DIR+'autoencoder-trained/training_curves.png', dpi=150, bbox_inches='tight')
     plt.close()
 
     print("✅ Event frame model, embeddings, and training info saved to 'autoencoder-trained'")

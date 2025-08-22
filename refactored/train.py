@@ -12,8 +12,8 @@ import torchvision.transforms as T
 
 import dataset
 import saliency
-import memory
 import embeddings
+import memory
 
 # Device setup
 device = torch.device("mps" if torch.backends.mps.is_available()

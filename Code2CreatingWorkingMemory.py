@@ -17,6 +17,7 @@ import torch.nn.functional as F
 
 # Add the EmbeddingExtractor import - REMOVED, using direct model loading
 from load_model import EmbeddingExtractor
+from load_model import EmbeddingExtractor
 
 import sspspace
 import torchvision.transforms as transforms
@@ -34,6 +35,16 @@ transform = T.Compose([
     T.Grayscale(),
     T.ToTensor(),
 ])
+
+
+# UPDATED: Use your actual model paths
+MODEL_PATH = "/media/matt/bigdata/DATA/CRIB/resultsbbox30050epochs/autoencoder-trained/model.pth"
+INFO_PATH = "/media/matt/bigdata/DATA/CRIB/resultsbbox30050epochs/autoencoder-trained/training_info.json"
+
+#ROOT = '/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/'
+ROOT = '/media/matt/bigdata/DATA/CRIB/'
+PATH_DATA = ROOT + 'train_event_frames/'  # Use original event frames
+MEMORY_SAVE_PATH = ROOT + 'workingmemorybbox30050epochs/'
 
 
 class Config:
@@ -70,13 +81,9 @@ class Config:
 def load_trained_model(device="cpu"):
     """Load the trained autoencoder model via EmbeddingExtractor"""
     try:
-        # UPDATED: Use your actual model paths
-        model_path = "/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/resultsbbox30050epochs/autoencoder-trained/model.pth"
-        info_path = "/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/resultsbbox30050epochs/autoencoder-trained/training_info.json"
-
         model = EmbeddingExtractor(
-            model_path=model_path,
-            info_path=info_path
+            model_path=MODEL_PATH,
+            info_path=INFO_PATH
         )
 
         print(f"✅ Loaded EmbeddingExtractor successfully!")
@@ -85,8 +92,8 @@ def load_trained_model(device="cpu"):
     except Exception as e:
         print(f"Failed to load EmbeddingExtractor: {e}")
         print("Make sure these files exist:")
-        print(f"  - {model_path}")
-        print(f"  - {info_path}")
+        print(f"  - {MODEL_PATH}")
+        print(f"  - {INFO_PATH}")
         return None
 
 
@@ -104,13 +111,8 @@ def main():
     if model is None:
         return
 
-    # Paths (no need to save bboxes anymore)
-    root = '/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/'
-    path_data = root + 'evframes/'  # Use original event frames
-    memory_save_path = root +'workingmemorytest/'#'workingmemorybbox30050epochs/'
-
     # Create directories
-    os.makedirs(memory_save_path, exist_ok=True)
+    os.makedirs(MEMORY_SAVE_PATH, exist_ok=True)
 
     # Initialize networks (exactly like your original)
     if OMSFLAG:
@@ -118,8 +120,8 @@ def main():
     net_attention = initialise_attention(device, config.ATTENTION_PARAMS)
 
     # Get objects (exactly like your original)
-    objects = natsorted([d for d in os.listdir(path_data)
-                         if os.path.isdir(os.path.join(path_data, d))])
+    objects = natsorted([d for d in os.listdir(PATH_DATA)
+                         if os.path.isdir(os.path.join(PATH_DATA, d))])
 
     print(f"Found {len(objects)} objects to process: {objects}")
 
@@ -145,7 +147,7 @@ def main():
         object_memory = coord_encoder.encode([[0, 0]])
 
         # Get path to object's event frames
-        obj_path_data = os.path.join(path_data, obj)
+        obj_path_data = os.path.join(PATH_DATA, obj)
 
         # Get all event frame files (exactly like your original)
         data_files = natsorted([f for f in os.listdir(obj_path_data)
@@ -251,17 +253,17 @@ def main():
         print(f"  Saving memory for {obj}...")
 
         # Save the final consolidated memory (exactly like your original)
-        memory_file = os.path.join(memory_save_path, f'{obj}_memory.npy')
+        memory_file = os.path.join(MEMORY_SAVE_PATH, f'{obj}_memory.npy')
         np.save(memory_file, object_memory)
 
         # Save the final image features (exactly like your original)
-        features_file = os.path.join(memory_save_path, f'{obj}_image_features.npy')
+        features_file = os.path.join(MEMORY_SAVE_PATH, f'{obj}_image_features.npy')
         np.save(features_file, image_features)
 
         print(f"  ✅ Saved {obj} memory and features with proper coordinates")
 
     print(f"\n✅ All objects processed successfully!")
-    print(f"Working memory saved to: {memory_save_path}")
+    print(f"Working memory saved to: {MEMORY_SAVE_PATH}")
 
 
 if __name__ == '__main__':

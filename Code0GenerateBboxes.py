@@ -25,6 +25,13 @@ transform = T.Compose([
 ])
 
 
+ROOT = '/media/matt/bigdata/DATA/CRIB/'
+SOURCE_PATH = ROOT + 'train_event_frames/'
+BBOX_BASE_PATH = ROOT + 'bboxes/'
+WIDTH, HEIGHT = 400, 400
+VISUALIZATION_FLAG = False
+
+
 class Config:
     ATTENTION_PARAMS = {
         'size_krn': 16,
@@ -69,7 +76,6 @@ def save_roi(roi_image, save_path, filename_base, img_format='png'):
 
         # Save the image
         roi_pil.save(full_path)
-        print(f"✓ Successfully saved ROI: {full_path}")
 
         return full_path
 
@@ -107,7 +113,7 @@ def visualize_roi_extraction_batch(source_path, device, config, visualisationFLA
     net_attention = initialise_attention(device, config.ATTENTION_PARAMS)
 
     # Processing parameters - reduced for memory efficiency
-    max_x, max_y = 200, 200  # Reduced from 400x400
+    max_x, max_y = WIDTH, HEIGHT  # Reduced from 400x400
     resolution = (max_y, max_x)
 
     if visualisationFLAG:
@@ -120,7 +126,7 @@ def visualize_roi_extraction_batch(source_path, device, config, visualisationFLA
     # Process batch files
     for idx, (obj, img_path, data_file) in enumerate(batch_files):
         try:
-            print(f"Processing batch file {idx + 1}/{len(batch_files)}: {obj}/{data_file}")
+            #print(f"Processing batch file {idx + 1}/{len(batch_files)}: {obj}/{data_file}")
 
             # Create bbox directory for this object if we haven't seen it before
             if obj not in processed_objects:
@@ -171,8 +177,8 @@ def visualize_roi_extraction_batch(source_path, device, config, visualisationFLA
 
             if saved_path is None:
                 print(f"✗ Failed to save ROI for {data_file}")
-            else:
-                print(f"✓ ROI saved successfully for {data_file}")
+            #else:
+            #    print(f"✓ ROI saved successfully for {data_file}")
 
             # Visualization (optional)
             if visualisationFLAG:
@@ -269,18 +275,14 @@ def main():
     print(f"Using device: {device}")
 
     config = Config()
-    root = '/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/'
-    source_path = root + 'evframes/'
-    bbox_base_path = root + 'bboxes/'
-    visualisationFLAG = True
 
     # Get all files
-    all_files = get_all_files(source_path)
+    all_files = get_all_files(SOURCE_PATH)
     total_files = len(all_files)
     print(f"Total files to process: {total_files}")
 
     # PROCESS IN BATCHES TO AVOID MEMORY ISSUES
-    batch_size = 100  # Reduced batch size from 200 to 100
+    batch_size = 64  # Reduced batch size from 200 to 100
 
     for batch_start in range(0, total_files, batch_size):
         batch_end = min(batch_start + batch_size, total_files)
@@ -297,8 +299,8 @@ def main():
         try:
             # Process this batch
             visualize_roi_extraction_batch(
-                source_path, device, config, visualisationFLAG,
-                300, bbox_base_path, batch_files
+                SOURCE_PATH, device, config, VISUALIZATION_FLAG,
+                100, BBOX_BASE_PATH, batch_files
             )
 
             # Aggressive cleanup between batches

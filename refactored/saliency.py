@@ -1,5 +1,11 @@
+import sys
+sys.path.append("../")
+
 import numpy as np
+import torchvision.transforms as T
+
 import pySaliencyMap
+from attention_helpers import initialise_attention, run_attention
 
 
 # superclass for any saliency method
@@ -70,5 +76,26 @@ class Config:
         'stride': 1,
         'out_ch': 1
     }
-config = Config()
+
+class OMSSaliency(Saliency):
+    def __init__(self, width, height, device):
+        super().__init__(width, height)
+        self.device = device
+        self.config = Config()
+
+        # Initialize attention network
+        self.net_attention = initialise_attention(device, self.config.ATTENTION_PARAMS)
+
+        self.transform = T.Compose([
+            T.Grayscale(),
+            T.ToTensor(),
+        ])
+
+    def get_saliency_map(self, img):
+        return run_attention(self.net_attention, img)
+
+    def get_next_fixation(self, img):
+        saliency_map, salmax_coords = self.get_saliency_map(img)
+        return salmax_coords, saliency_map[salmax_coords]
+
 
