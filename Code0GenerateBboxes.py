@@ -28,7 +28,9 @@ transform = T.Compose([
 ROOT = '/media/matt/bigdata/DATA/CRIB/'
 SOURCE_PATH = ROOT + 'train_event_frames/'
 BBOX_BASE_PATH = ROOT + 'bboxes/'
+BATCH_SIZE = 64
 WIDTH, HEIGHT = 400, 400
+ROI_SIZE = 100  # Fixed size for bounding boxes
 VISUALIZATION_FLAG = False
 
 
@@ -282,14 +284,13 @@ def main():
     print(f"Total files to process: {total_files}")
 
     # PROCESS IN BATCHES TO AVOID MEMORY ISSUES
-    batch_size = 64  # Reduced batch size from 200 to 100
 
-    for batch_start in range(0, total_files, batch_size):
-        batch_end = min(batch_start + batch_size, total_files)
+    for batch_start in range(0, total_files, BATCH_SIZE):
+        batch_end = min(batch_start + BATCH_SIZE, total_files)
         batch_files = all_files[batch_start:batch_end]
 
-        batch_num = batch_start // batch_size + 1
-        total_batches = (total_files - 1) // batch_size + 1
+        batch_num = batch_start // BATCH_SIZE + 1
+        total_batches = (total_files - 1) // BATCH_SIZE + 1
 
         print(f"\n{'=' * 60}")
         print(f"Processing batch {batch_num}/{total_batches}")
@@ -300,7 +301,7 @@ def main():
             # Process this batch
             visualize_roi_extraction_batch(
                 SOURCE_PATH, device, config, VISUALIZATION_FLAG,
-                100, BBOX_BASE_PATH, batch_files
+                ROI_SIZE, BBOX_BASE_PATH, batch_files
             )
 
             # Aggressive cleanup between batches
