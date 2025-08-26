@@ -6,7 +6,6 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 import torch.nn.functional as F
 import torch.nn as nn
-from sklearn.metrics import accuracy_score, classification_report
 import json
 import matplotlib.pyplot as plt
 import numpy as np
@@ -22,20 +21,19 @@ data_root = "/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_dat
 results_dir = "/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/resultsbbox30050epochs/"
 
 batch_size = 32
-num_epochs = 50 #we already tried with 8
+num_epochs = 1 #50 #we already tried with 8
 lr = 1e-3 #1e-3
 weight_decay = 1e-4
 # New parameters for autoencoder
 embedding_dim = 512
 reconstruction_weight = 0.5  # Weight for reconstruction loss
-classification_weight = 0.5  # Weight for classification loss
 
 
 # --------------------------
 # AUTOENCODER + CLASSIFIER MODEL (UPDATED FOR EVENT FRAMES)
 # --------------------------
 class AutoencoderClassifier(nn.Module):
-    def __init__(self, num_classes, embedding_dim=512, input_channels=1):  # CHANGED: default to 1 channel
+    def __init__(self, embedding_dim=512, input_channels=1):  # CHANGED: default to 1 channel
         super().__init__()
 
         # Shared encoder - optimized for event frames
@@ -119,17 +117,6 @@ class AutoencoderClassifier(nn.Module):
             nn.Sigmoid()  # Output between 0 and 1
         )
 
-        # Classification head
-        self.classifier = nn.Sequential(
-            nn.Linear(embedding_dim, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(256, 128),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.3),
-            nn.Linear(128, num_classes)
-        )
-
         # Initialize weights
         self._initialize_weights()
 
@@ -154,13 +141,10 @@ class AutoencoderClassifier(nn.Module):
         # Decode for reconstruction
         reconstructed = self.decoder(embeddings)
 
-        # Classify
-        class_logits = self.classifier(embeddings)
-
-        return embeddings, reconstructed, class_logits
+        return embeddings, reconstructed
 
     def get_embeddings(self, x):
-        """Extract embeddings without reconstruction/classification"""
+        """Extract embeddings without reconstruction"""
         with torch.no_grad():
             encoded = self.encoder(x)
             embeddings = self.embedding_layer(encoded)
@@ -241,7 +225,7 @@ def visualize_reconstructions(model, val_loader, device, num_samples=8):
     images = images[:num_samples].to(device)
 
     with torch.no_grad():
-        embeddings, reconstructed, _ = model(images)
+        embeddings, reconstructed = model(images)
 
     # CHANGED: Denormalize for grayscale visualization
     mean = torch.tensor([0.5]).view(1, 1, 1, 1).to(device)
@@ -308,8 +292,7 @@ def train_model():
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
     # CHANGED: Initialize model with 1 input channel for event frames
-    model = AutoencoderClassifier(len(class_names),
-                                 embedding_dim=embedding_dim,
+    model = AutoencoderClassifier(embedding_dim=embedding_dim,
                                  input_channels=input_channels).to(device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -318,27 +301,21 @@ def train_model():
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.1)
 
     # Loss functions
-    classification_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     reconstruction_criterion = nn.MSELoss()
 
     # Training loop
-    best_val_acc = 0.0
     patience = 10
     patience_counter = 0
+    best_val_recon_loss = None
 
     train_losses = []
     val_losses = []
-    train_accs = []
-    val_accs = []
 
     for epoch in range(num_epochs):
         # Training phase
         model.train()
         train_loss = 0.0
         train_recon_loss = 0.0
-        train_class_loss = 0.0
-        train_correct = 0
-        train_total = 0
 
         train_loop = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Train]")
 
@@ -348,103 +325,62 @@ def train_model():
             optimizer.zero_grad()
 
             # Forward pass
-            embeddings, reconstructed, class_logits = model(images)
+            embeddings, reconstructed = model(images)
 
             # Calculate losses
             recon_loss = reconstruction_criterion(reconstructed, images)
-            class_loss = classification_criterion(class_logits, labels)
 
-            # Combined loss
-            total_loss = reconstruction_weight * recon_loss + classification_weight * class_loss
-
-            total_loss.backward()
+            recon_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            # Statistics
-            _, predicted = torch.max(class_logits.data, 1)
-            train_total += labels.size(0)
-            train_correct += (predicted == labels).sum().item()
-            train_loss += total_loss.item()
-            train_recon_loss += recon_loss.item()
-            train_class_loss += class_loss.item()
-
             train_loop.set_postfix(
-                total_loss=total_loss.item(),
                 recon_loss=recon_loss.item(),
-                class_loss=class_loss.item(),
-                acc=100 * train_correct / train_total
+                acc=0
             )
 
-        # Validation phase
+        # Validation phase (reconstruction only)
         model.eval()
-        val_loss = 0.0
         val_recon_loss = 0.0
-        val_class_loss = 0.0
-        val_correct = 0
         val_total = 0
-        all_preds = []
-        all_labels = []
 
         with torch.no_grad():
             for images, labels in tqdm(val_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Val]"):
-                images, labels = images.to(device), labels.to(device)
+                images = images.to(device)
 
-                embeddings, reconstructed, class_logits = model(images)
+                embeddings, reconstructed = model(images)[:2]  # Only use embeddings and reconstructed
 
                 recon_loss = reconstruction_criterion(reconstructed, images)
-                class_loss = classification_criterion(class_logits, labels)
-                total_loss = reconstruction_weight * recon_loss + classification_weight * class_loss
+                val_recon_loss += recon_loss.item() * images.size(0)
+                val_total += images.size(0)
 
-                _, predicted = torch.max(class_logits.data, 1)
-                val_total += labels.size(0)
-                val_correct += (predicted == labels).sum().item()
-                val_loss += total_loss.item()
-                val_recon_loss += recon_loss.item()
-                val_class_loss += class_loss.item()
-
-                all_preds.extend(predicted.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
+        avg_val_recon_loss = val_recon_loss / val_total
+        print(f"Validation Reconstruction Loss: {avg_val_recon_loss:.4f}")
 
         scheduler.step()
 
-        # Calculate accuracies
-        train_acc = 100 * train_correct / train_total
-        val_acc = 100 * val_correct / val_total
-
         # Store metrics
         train_losses.append(train_loss / len(train_loader))
-        val_losses.append(val_loss / len(val_loader))
-        train_accs.append(train_acc)
-        val_accs.append(val_acc)
+        val_losses.append(avg_val_recon_loss)
 
         print(f"Epoch {epoch + 1}/{num_epochs}:")
         print(
-            f"  Train - Total: {train_loss / len(train_loader):.4f}, Recon: {train_recon_loss / len(train_loader):.4f}, Class: {train_class_loss / len(train_loader):.4f}, Acc: {train_acc:.2f}%")
+            f"  Train - Total: {train_loss / len(train_loader):.4f}, Recon: {train_recon_loss / len(train_loader):.4f}")
         print(
-            f"  Val - Total: {val_loss / len(val_loader):.4f}, Recon: {val_recon_loss / len(val_loader):.4f}, Class: {val_class_loss / len(val_loader):.4f}, Acc: {val_acc:.2f}%")
+            f"  Val - Total: {avg_val_recon_loss:.4f}, Recon: {val_recon_loss / len(val_loader):.4f}%")
 
-        # Early stopping and model saving
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        # Early stopping and model saving (using validation reconstruction loss)
+        if best_val_recon_loss is None or avg_val_recon_loss < best_val_recon_loss:
+            best_val_recon_loss = avg_val_recon_loss
             patience_counter = 0
             torch.save({
-                'epoch': epoch,
                 'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_acc': val_acc,
-                'class_names': class_names,
-                'class_to_idx': class_to_idx,
+                'epoch': epoch,
                 'embedding_dim': embedding_dim,
-                'reconstruction_weight': reconstruction_weight,
-                'classification_weight': classification_weight,
-                'input_channels': input_channels,  # ADDED: Save input channels info
-            }, os.path.join(results_dir, "best_autoencoder_classifier.pth"))
-            print(f"  ✅ New best model saved! Val Acc: {val_acc:.2f}%")
-
-            # Save reconstruction visualizations
+                # add other metadata as needed
+            }, os.path.join(results_dir, "best_autoencoder.pth"))
+            print(f"  ✅ New best model saved! Val Recon Loss: {avg_val_recon_loss:.4f}")
             visualize_reconstructions(model, val_loader, device)
-
         else:
             patience_counter += 1
             if patience_counter >= patience:
@@ -452,51 +388,35 @@ def train_model():
                 break
 
     # Final evaluation
-    checkpoint = torch.load(os.path.join(results_dir, "best_autoencoder_classifier.pth"))
+    checkpoint = torch.load(os.path.join(results_dir, "best_autoencoder.pth"))
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
     # Final predictions
-    all_preds = []
     all_labels = []
     all_embeddings = []
-
     with torch.no_grad():
         for images, labels in tqdm(val_loader, desc="Final Evaluation"):
             images = images.to(device)
-            embeddings, _, class_logits = model(images)
-            _, predicted = torch.max(class_logits.data, 1)
-
-            all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            embeddings, _ = model(images)
             all_embeddings.extend(embeddings.cpu().numpy())
 
-    final_acc = accuracy_score(all_labels, all_preds)
-    print(f"\nFinal Validation Accuracy: {final_acc * 100:.2f}%")
-    print("\nClassification Report:")
-    print(classification_report(all_labels, all_preds, target_names=class_names))
-
     # Save final model and embeddings
-    os.makedirs(results_dir+"autoencoder-classifier-trained", exist_ok=True)
-    torch.save(model.state_dict(), results_dir+"autoencoder-classifier-trained/model.pth")
+    os.makedirs(results_dir+"autoencoder-trained", exist_ok=True)
+    torch.save(model.state_dict(), results_dir+"autoencoder-trained/model.pth")
 
     # Save embeddings
-    np.save(results_dir+"autoencoder-classifier-trained/embeddings.npy", np.array(all_embeddings))
-    np.save(results_dir+"autoencoder-classifier-trained/labels.npy", np.array(all_labels))
+    np.save(results_dir+"autoencoder-trained/embeddings.npy", np.array(all_embeddings))
+    np.save(results_dir+"autoencoder-trained/labels.npy", np.array(all_labels))
 
     # Save training info with updated metadata
-    with open(os.path.join(results_dir, "autoencoder-classifier-trained/training_info.json"), "w") as f:
+    with open(os.path.join(results_dir, "autoencoder-trained/training_info.json"), "w") as f:
         json.dump({
-            "class_names": class_names,
-            "class_to_idx": class_to_idx,
-            "final_accuracy": final_acc,
             "num_epochs": num_epochs,
             "batch_size": batch_size,
             "learning_rate": lr,
             "embedding_dim": embedding_dim,
             "reconstruction_weight": reconstruction_weight,
-            "classification_weight": classification_weight,
-            "num_classes": len(class_names),
             "input_channels": input_channels,  # ADDED
             "data_type": "event_frames_grayscale"  # ADDED
         }, f, indent=2)
@@ -504,7 +424,6 @@ def train_model():
     # Plot training curves
     plt.figure(figsize=(12, 4))
 
-    plt.subplot(1, 2, 1)
     plt.plot(train_losses, label='Train Loss')
     plt.plot(val_losses, label='Val Loss')
     plt.title('Training and Validation Loss (Event Frames)')
@@ -512,20 +431,30 @@ def train_model():
     plt.ylabel('Loss')
     plt.legend()
 
-    plt.subplot(1, 2, 2)
-    plt.plot(train_accs, label='Train Accuracy')
-    plt.plot(val_accs, label='Val Accuracy')
-    plt.title('Training and Validation Accuracy (Event Frames)')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy (%)')
-    plt.legend()
-
     plt.tight_layout()
-    plt.savefig(results_dir+'autoencoder-classifier-trained/training_curves.png', dpi=150, bbox_inches='tight')
+    plt.savefig(results_dir+'autoencoder-trained/training_curves.png', dpi=150, bbox_inches='tight')
     plt.close()
 
-    print("✅ Event frame model, embeddings, and training info saved to 'autoencoder-classifier-trained'")
+    print("✅ Event frame model, embeddings, and training info saved to 'autoencoder-trained'")
 
 
 if __name__ == '__main__':
     train_model()
+
+    # # load the model and pass dummy data through get_embeddings()
+    # model_path = "/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/resultsbbox30050epochs/autoencoder-trained/model.pth"
+    # device = torch.device("mps")
+    # model = AutoencoderClassifier(embedding_dim=512).to(device)
+    #
+    # # Load trained weights
+    # state_dict = torch.load(model_path, map_location=device)
+    # model.load_state_dict(state_dict)
+    # model.eval()
+    #
+    # print(f"✅ Model loaded from: {model_path}")
+    #
+    # # pass some dummy data through
+    # x = torch.randn(224, 224).float().unsqueeze(0).unsqueeze(0).to(device)  # single grayscale image
+    # print(x.shape)  # Should print: torch.Size([1, 1, 224, 224])
+    # embeddings = model.get_embeddings(x)
+    # print(embeddings.shape)

@@ -272,7 +272,7 @@ def main():
     root = '/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/'
     source_path = root + 'evframes/'
     bbox_base_path = root + 'bboxes/'
-    visualisationFLAG = False
+    visualisationFLAG = True
 
     # Get all files
     all_files = get_all_files(source_path)

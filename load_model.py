@@ -11,8 +11,8 @@ from Code1Training import AutoencoderClassifier
 
 
 class EmbeddingExtractor:
-    def __init__(self, model_path="autoencoder-classifier-trained/model.pth",
-                 info_path="autoencoder-classifier-trained/training_info.json"):
+    def __init__(self, model_path="autoencoder-trained/model.pth",
+                 info_path="autoencoder-trained/training_info.json"):
         """
         Initialize the embedding extractor
 
@@ -46,12 +46,10 @@ class EmbeddingExtractor:
         if os.path.exists(info_path):
             with open(info_path, 'r') as f:
                 training_info = json.load(f)
-            print(f"Loaded training info: {training_info['num_classes']} classes")
             return training_info
         else:
             print("Warning: Training info not found, using default values")
             return {
-                'num_classes': 10,  # Default, adjust as needed
                 'embedding_dim': 512,
                 'class_names': []
             }
@@ -61,7 +59,6 @@ class EmbeddingExtractor:
         try:
             # Initialize model with correct parameters
             model = AutoencoderClassifier(
-                num_classes=self.training_info['num_classes'],
                 embedding_dim=self.training_info.get('embedding_dim', 512)
             ).to(self.device)
 
@@ -89,10 +86,6 @@ class EmbeddingExtractor:
         """
         if not isinstance(image_array, np.ndarray):
             raise ValueError("Input must be a numpy array")
-
-        # Ensure the array is in the right format
-        if len(image_array.shape) != 3 or image_array.shape[2] != 3:
-            raise ValueError("Image array must be of shape (H, W, 3)")
 
         # Convert to PIL Image for preprocessing
         # Handle different data types
@@ -138,19 +131,7 @@ class EmbeddingExtractor:
         image_tensor = self.preprocess_image(image_array)
 
         with torch.no_grad():
-            embeddings, reconstructed, class_logits = self.model(image_tensor)
-
-            # Get predicted class
-            probabilities = torch.softmax(class_logits, dim=1)
-            predicted_class_idx = torch.argmax(class_logits, dim=1).item()
-            confidence = torch.max(probabilities, dim=1)[0].item()
-
-            # Get class name if available
-            class_names = self.training_info.get('class_names', [])
-            if predicted_class_idx < len(class_names):
-                predicted_class_name = class_names[predicted_class_idx]
-            else:
-                predicted_class_name = f"class_{predicted_class_idx}"
+            embeddings, reconstructed = self.model(image_tensor)
 
             # Convert reconstructed image back to numpy
             reconstructed_np = reconstructed.cpu().numpy().squeeze()
@@ -163,11 +144,7 @@ class EmbeddingExtractor:
 
             return {
                 'embeddings': embeddings.cpu().numpy().squeeze(),
-                'reconstructed': reconstructed_np,
-                'predicted_class_idx': predicted_class_idx,
-                'predicted_class_name': predicted_class_name,
-                'confidence': confidence,
-                'probabilities': probabilities.cpu().numpy().squeeze()
+                'reconstructed': reconstructed_np
             }
 
     def get_similarity(self, image_array1, image_array2):

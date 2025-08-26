@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Add the EmbeddingExtractor import - REMOVED, using direct model loading
-# from load_model import EmbeddingExtractor
+from load_model import EmbeddingExtractor
 
 import sspspace
 import torchvision.transforms as transforms
@@ -71,8 +71,8 @@ def load_trained_model(device="cpu"):
     """Load the trained autoencoder model via EmbeddingExtractor"""
     try:
         # UPDATED: Use your actual model paths
-        model_path = "/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/resultsbbox30050epochs/autoencoder-classifier-trained/model.pth"
-        info_path = "/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/resultsbbox30050epochs/autoencoder-classifier-trained/training_info.json"
+        model_path = "/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/resultsbbox30050epochs/autoencoder-trained/model.pth"
+        info_path = "/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/resultsbbox30050epochs/autoencoder-trained/training_info.json"
 
         model = EmbeddingExtractor(
             model_path=model_path,
@@ -97,6 +97,7 @@ def main():
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using device: {device}")
     config = Config()
+    OMSFLAG = False
 
     # Load trained model
     model = load_trained_model(device=device)
@@ -106,13 +107,14 @@ def main():
     # Paths (no need to save bboxes anymore)
     root = '/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/'
     path_data = root + 'evframes/'  # Use original event frames
-    memory_save_path = root + 'workingmemorybbox30050epochs/'
+    memory_save_path = root +'workingmemorytest/'#'workingmemorybbox30050epochs/'
 
     # Create directories
     os.makedirs(memory_save_path, exist_ok=True)
 
     # Initialize networks (exactly like your original)
-    net_center, net_surround = initialize_oms(device, config.OMS_PARAMS)
+    if OMSFLAG:
+        net_center, net_surround = initialize_oms(device, config.OMS_PARAMS)
     net_attention = initialise_attention(device, config.ATTENTION_PARAMS)
 
     # Get objects (exactly like your original)
@@ -129,13 +131,14 @@ def main():
         max_x, max_y = 400, 400
         resolution = (max_y, max_x)
         box_size = 350
-        size_krn_after_oms = 343
-        OMS = np.zeros((size_krn_after_oms, size_krn_after_oms), dtype=np.float32)
-        vSliceOMS = torch.zeros((1, size_krn_after_oms, size_krn_after_oms), dtype=torch.float32).to(device)
+        if OMSFLAG:
+            size_krn_after_oms = 343
+            OMS = np.zeros((size_krn_after_oms, size_krn_after_oms), dtype=np.float32)
+            vSliceOMS = torch.zeros((1, size_krn_after_oms, size_krn_after_oms), dtype=torch.float32).to(device)
         saliency_map = np.zeros((max_y, max_x), dtype=np.float32)
         salmax_coords = np.zeros((2,), dtype=np.int32)
 
-        # Initialize coordinate encoder (exactly like your original)
+        # Initialize coordinate encoder (exactly like your original) - spatial semantic pointer
         coord_encoder = sspspace.RandomSSPSpace(domain_dim=2, ssp_dim=512)
 
         # Initialize object memory (exactly like your original)
@@ -160,25 +163,25 @@ def main():
                 window = transform(img)
                 window_original = window
 
-                # Computing egomotion (exactly like your original)
-                wOMS = torch.tensor(window, dtype=torch.float32).to(device)
-                OMS, indexes = egomotion(wOMS, net_center, net_surround, device, config.MAX_Y,
-                                         config.MAX_X, config.OMS_PARAMS['threshold'])
-
-                # Dynamically get the actual OMS size (no more hardcoding!)
-                if vSliceOMS is None:
-                    # Initialize vSliceOMS based on actual OMS output size
-                    oms_shape = OMS.shape
-                    print(f"    Detected OMS output shape: {oms_shape}")
-                    if len(oms_shape) == 4:  # [batch, channel, height, width]
-                        vSliceOMS = torch.zeros((1, oms_shape[2], oms_shape[3]), dtype=torch.float32).to(device)
-                    elif len(oms_shape) == 3:  # [channel, height, width]
-                        vSliceOMS = torch.zeros((1, oms_shape[1], oms_shape[2]), dtype=torch.float32).to(device)
-                    else:
-                        print(f"    Unexpected OMS shape: {oms_shape}")
-                        vSliceOMS = torch.zeros_like(OMS.squeeze(0) if len(oms_shape) > 3 else OMS).to(device)
-
-                vSliceOMS = OMS.squeeze(0)
+                # # Computing egomotion (exactly like your original)
+                # wOMS = torch.tensor(window, dtype=torch.float32).to(device)
+                # OMS, indexes = egomotion(wOMS, net_center, net_surround, device, config.MAX_Y,
+                #                          config.MAX_X, config.OMS_PARAMS['threshold'])
+                #
+                # # Dynamically get the actual OMS size (no more hardcoding!)
+                # if vSliceOMS is None:
+                #     # Initialize vSliceOMS based on actual OMS output size
+                #     oms_shape = OMS.shape
+                #     print(f"    Detected OMS output shape: {oms_shape}")
+                #     if len(oms_shape) == 4:  # [batch, channel, height, width]
+                #         vSliceOMS = torch.zeros((1, oms_shape[2], oms_shape[3]), dtype=torch.float32).to(device)
+                #     elif len(oms_shape) == 3:  # [channel, height, width]
+                #         vSliceOMS = torch.zeros((1, oms_shape[1], oms_shape[2]), dtype=torch.float32).to(device)
+                #     else:
+                #         print(f"    Unexpected OMS shape: {oms_shape}")
+                #         vSliceOMS = torch.zeros_like(OMS.squeeze(0) if len(oms_shape) > 3 else OMS).to(device)
+                #
+                # vSliceOMS = OMS.squeeze(0)
 
                 # Run attention mechanism (exactly like your original)
                 saliency_map[:], salmax_coords[:] = run_attention(
@@ -202,20 +205,17 @@ def main():
                 roi_crop_gray = window_img[y1:y2, x1:x2]  # Keep as grayscale
                 roi_tensor = event_transform(roi_crop_gray)
 
+                ######## we have a mismatch of the size
+
+
                 with torch.no_grad():
                     # Convert tensor to numpy format expected by EmbeddingExtractor
                     roi_for_model = roi_tensor.detach().cpu().numpy()
+                    #
+                    # # Denormalize from [-1,1] to [0,255] and convert to uint8
+                    # roi_for_model = ((roi_for_model + 1) * 127.5).astype(np.uint8)
 
-                    # Handle single channel properly
-                    if len(roi_for_model.shape) == 3 and roi_for_model.shape[0] == 1:
-                        roi_for_model = roi_for_model.squeeze(0)  # Remove channel dimension
-
-                    # Denormalize from [-1,1] to [0,255] and convert to uint8
-                    roi_for_model = ((roi_for_model + 1) * 127.5).astype(np.uint8)
-
-                    # Convert to 3-channel for model compatibility (if needed)
-                    if len(roi_for_model.shape) == 2:
-                        roi_for_model = np.stack([roi_for_model] * 3, axis=-1)
+                    print("ROI shape", roi_for_model.shape)
 
                     # Get embeddings using your trained model
                     image_features = model.get_embeddings(roi_for_model)
