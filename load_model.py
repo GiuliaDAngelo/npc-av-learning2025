@@ -5,7 +5,6 @@ import torchvision.transforms as transforms
 import numpy as np
 import json
 import os
-import cv2
 
 # Import your model (make sure this path is correct)
 from Code1Training import AutoencoderClassifier
@@ -37,7 +36,7 @@ class EmbeddingExtractor:
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=[0.5], std=[0.5])
         ])
 
         print("✅ Embedding extractor ready!")
@@ -80,7 +79,7 @@ class EmbeddingExtractor:
         Preprocess numpy array image for the model
 
         Args:
-            image_array: numpy array of shape (H, W, 3) with values 0-255
+            image_array: numpy array of shape (H, W, 1) with values 0-255
 
         Returns:
             torch.Tensor: Preprocessed image tensor
@@ -101,89 +100,24 @@ class EmbeddingExtractor:
 
         # Apply preprocessing
         image_tensor = self.transform(image).unsqueeze(0)  # Add batch dimension
+
         return image_tensor.to(self.device)
 
-    # def get_embeddings(self, image_array):
-    #     """
-    #     Extract embeddings from an image numpy array
-    #
-    #     Args:
-    #         image_array: numpy array of shape (H, W, 3) with values 0-255
-    #
-    #     Returns:
-    #         numpy.ndarray: Embedding vector of shape (embedding_dim,)
-    #     """
-    #     image_tensor = self.preprocess_image(image_array)
-    #
-    #     with torch.no_grad():
-    #         embeddings = self.model.get_embeddings(image_tensor)
-    #         return embeddings.cpu().numpy().squeeze()
     def get_embeddings(self, image_array):
-        """Extract embeddings with full debugging - FIXED VERSION"""
-        # print(f"DEBUG: get_embeddings called with shape: {image_array.shape}, dtype: {image_array.dtype}")
+        """
+        Extract embeddings from an image numpy array
+
+        Args:
+            image_array: numpy array of shape (H, W, 1) with values 0-255
+
+        Returns:
+            numpy.ndarray: Embedding vector of shape (embedding_dim,)
+        """
+        image_tensor = self.preprocess_image(image_array)
 
         with torch.no_grad():
-            try:
-                # Step 1: Input validation
-                if not isinstance(image_array, np.ndarray):
-                    raise ValueError(f"Expected numpy array, got {type(image_array)}")
-
-                if image_array.ndim != 2:
-                    raise ValueError(f"Expected 2D array, got {image_array.ndim}D")
-
-                # print(f"DEBUG: Input validation passed")
-
-                # Step 2: Resize if needed
-                if image_array.shape != (224, 224):
-                    # print(f"DEBUG: Resizing from {image_array.shape} to (224, 224)")
-                    # Use OpenCV instead of PIL to avoid broadcast issues
-                    image_array = cv2.resize(image_array, (224, 224), interpolation=cv2.INTER_LINEAR)
-                    # print(f"DEBUG: After resize: {image_array.shape}")
-
-                # Step 3: Convert to tensor and ensure proper dtype
-                # print(f"DEBUG: Converting to tensor...")
-                tensor = torch.from_numpy(image_array.copy()).float()  # Add .copy() and explicit .float()
-                # print(f"DEBUG: Base tensor shape: {tensor.shape}, dtype: {tensor.dtype}")
-
-                # Step 4: Add dimensions for batch and channel
-                tensor = tensor.unsqueeze(0).unsqueeze(0)  # [H, W] -> [1, 1, H, W]
-                # print(f"DEBUG: After unsqueeze: {tensor.shape}")
-
-                # Step 5: Normalize - FIXED to handle broadcasting properly
-                # print(f"DEBUG: Normalizing...")
-                # print(f"DEBUG: Before normalization: range=[{tensor.min():.3f}, {tensor.max():.3f}]")
-
-                # Method 1: Step by step normalization to avoid broadcasting issues
-                tensor = tensor / 255.0  # Scale to [0, 1]
-                tensor = tensor - 0.5  # Center around 0
-                tensor = tensor / 0.5  # Scale to [-1, 1]
-
-                # Alternative method if above fails:
-                # tensor = tensor.div(255.0).sub(0.5).div(0.5)
-
-                # print(
-                #     f"DEBUG: After normalization: shape={tensor.shape}, range=[{tensor.min():.3f}, {tensor.max():.3f}]")
-
-                # Step 6: Move to device
-                # print(f"DEBUG: Moving to device {self.device}")
-                tensor = tensor.to(self.device)
-                # print(f"DEBUG: Tensor on device: {tensor.shape}")
-
-                # Step 7: Call model
-                # print(f"DEBUG: Calling model.get_embeddings...")
-                embeddings = self.model.get_embeddings(tensor)
-                # print(f"DEBUG: Model returned embeddings with shape: {embeddings.shape}")
-
-                # Step 8: Convert and return
-                embeddings_np = embeddings.cpu().numpy().flatten()
-                # print(f"DEBUG: Final embeddings shape: {embeddings_np.shape}")
-                return embeddings_np
-
-            except Exception as e:
-                # print(f"DEBUG: Exception in get_embeddings: {e}")
-                import traceback
-                traceback.print_exc()
-                raise e
+            embeddings = self.model.get_embeddings(image_tensor)
+            return embeddings.cpu().numpy().squeeze()
 
     def get_full_prediction(self, image_array):
         """
