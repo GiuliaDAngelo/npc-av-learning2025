@@ -1,46 +1,26 @@
 import os
-from PIL import Image
-from tqdm import tqdm
+import json
+import numpy as np
+import cv2
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-import torch.nn.functional as F
-import torch.nn as nn
-import json
+from PIL import Image
+from tqdm import tqdm
 import matplotlib.pyplot as plt
-import numpy as np
-
-# --------------------------
-# CONFIG
-# --------------------------
-device = torch.device("mps" if torch.backends.mps.is_available()
-                      else "cuda" if torch.cuda.is_available()
-else "cpu")
 
 
-DATA_ROOT = '/media/matt/bigdata/DATA/CRIB/bboxes/'
-RESULTS_DIR = '/media/matt/bigdata/DATA/CRIB/resultsbbox30050epochs/'
-
-batch_size = 32
-num_epochs = 1 #50 #we already tried with 8
-num_epochs = 1 #we already tried with 8
-lr = 1e-3 #1e-3
-weight_decay = 1e-4
-# New parameters for autoencoder
-embedding_dim = 512
-reconstruction_weight = 0.5  # Weight for reconstruction loss
-
-
-# --------------------------
-# AUTOENCODER + CLASSIFIER MODEL (UPDATED FOR EVENT FRAMES)
-# --------------------------
 class AutoencoderClassifier(nn.Module):
-    def __init__(self, embedding_dim=512, input_channels=1):  # CHANGED: default to 1 channel
+    """Autoencoder model optimized for event frames (grayscale input)"""
+
+    def __init__(self, embedding_dim=512, input_channels=1):
         super().__init__()
 
-        # Shared encoder - optimized for event frames
+        # Encoder
         self.encoder = nn.Sequential(
-            # First conv block
+            # Block 1: 224x224 -> 112x112
             nn.Conv2d(input_channels, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
@@ -50,7 +30,7 @@ class AutoencoderClassifier(nn.Module):
             nn.MaxPool2d(2, 2),
             nn.Dropout2d(0.1),
 
-            # Second conv block
+            # Block 2: 112x112 -> 56x56
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
@@ -60,7 +40,7 @@ class AutoencoderClassifier(nn.Module):
             nn.MaxPool2d(2, 2),
             nn.Dropout2d(0.2),
 
-            # Third conv block
+            # Block 3: 56x56 -> 28x28
             nn.Conv2d(128, 256, kernel_size=3, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
@@ -70,7 +50,7 @@ class AutoencoderClassifier(nn.Module):
             nn.MaxPool2d(2, 2),
             nn.Dropout2d(0.3),
 
-            # Fourth conv block
+            # Block 4: 28x28 -> 7x7
             nn.Conv2d(256, 512, kernel_size=3, padding=1),
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
@@ -88,43 +68,42 @@ class AutoencoderClassifier(nn.Module):
             nn.Dropout(0.3)
         )
 
-        # Decoder for reconstruction (UPDATED FOR EVENT FRAMES)
+        # Decoder
         self.decoder = nn.Sequential(
             nn.Linear(embedding_dim, 512 * 7 * 7),
             nn.ReLU(inplace=True),
             nn.Unflatten(1, (512, 7, 7)),
 
-            # First upsampling: 7x7 -> 14x14
+            # 7x7 -> 14x14
             nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
 
-            # Second upsampling: 14x14 -> 28x28
+            # 14x14 -> 28x28
             nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
 
-            # Third upsampling: 28x28 -> 56x56
+            # 28x28 -> 56x56
             nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
 
-            # Fourth upsampling: 56x56 -> 112x112
+            # 56x56 -> 112x112
             nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
 
-            # Fifth upsampling: 112x112 -> 224x224 (CHANGED: output 1 channel for grayscale)
+            # 112x112 -> 224x224
             nn.ConvTranspose2d(32, input_channels, kernel_size=4, stride=2, padding=1),
-            nn.Sigmoid()  # Output between 0 and 1
+            nn.Sigmoid()
         )
 
-        # Initialize weights
         self._initialize_weights()
 
     def _initialize_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
@@ -136,13 +115,9 @@ class AutoencoderClassifier(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-        # Encode
         encoded = self.encoder(x)
         embeddings = self.embedding_layer(encoded)
-
-        # Decode for reconstruction
         reconstructed = self.decoder(embeddings)
-
         return embeddings, reconstructed
 
     def get_embeddings(self, x):
@@ -153,10 +128,9 @@ class AutoencoderClassifier(nn.Module):
         return embeddings
 
 
-# --------------------------
-# DATASET (UPDATED FOR EVENT FRAMES)
-# --------------------------
 class EventDataset(Dataset):
+    """Dataset for event frame images"""
+
     def __init__(self, root_dir, class_to_idx, transform=None):
         self.samples = []
         self.class_to_idx = class_to_idx
@@ -179,284 +153,307 @@ class EventDataset(Dataset):
     def __getitem__(self, idx):
         image_path, label = self.samples[idx]
         try:
-            # CHANGED: Convert to grayscale for event frames
-            image = Image.open(image_path).convert("L")  # Force grayscale for event frames
-
+            image = Image.open(image_path).convert("L")  # Grayscale
             if self.transform:
                 image = self.transform(image)
-
             return image, label
         except Exception as e:
             print(f"Error loading image {image_path}: {e}")
             return self.__getitem__((idx + 1) % len(self.samples))
 
 
-# --------------------------
-# TRANSFORMS (UPDATED FOR EVENT FRAMES)
-# --------------------------
-def get_event_transforms(train=True):
-    """Optimized transforms for event frames"""
+class EventFrameEmbeddingExtractor:
+    """Embedding extractor for trained event frame autoencoder"""
+
+    def __init__(self, model_path, info_path=None, device=None):
+        # Set device
+        if device is None:
+            self.device = torch.device(
+                "mps" if torch.backends.mps.is_available()
+                else "cuda" if torch.cuda.is_available()
+                else "cpu"
+            )
+        else:
+            self.device = device
+
+        # Load model configuration
+        self.embedding_dim = 512
+        self.input_channels = 1
+
+        if info_path and os.path.exists(info_path):
+            with open(info_path, 'r') as f:
+                info = json.load(f)
+                self.embedding_dim = info.get('embedding_dim', 512)
+                self.input_channels = info.get('input_channels', 1)
+
+        # Initialize and load model
+        self.model = AutoencoderClassifier(
+            embedding_dim=self.embedding_dim,
+            input_channels=self.input_channels
+        ).to(self.device)
+
+        state_dict = torch.load(model_path, map_location=self.device)
+        self.model.load_state_dict(state_dict)
+        self.model.eval()
+
+        print(f"Model loaded successfully on {self.device}")
+
+    def get_embeddings(self, image_array):
+        """Extract embeddings from 2D grayscale image array"""
+        with torch.no_grad():
+            # Input validation
+            if not isinstance(image_array, np.ndarray) or image_array.ndim != 2:
+                raise ValueError("Expected 2D numpy array")
+
+            # Resize if needed
+            if image_array.shape != (224, 224):
+                image_array = cv2.resize(image_array, (224, 224), interpolation=cv2.INTER_LINEAR)
+
+            # Convert to tensor and normalize
+            tensor = torch.from_numpy(image_array).float()
+            tensor = tensor.unsqueeze(0).unsqueeze(0)  # Add batch and channel dims
+            tensor = (tensor / 255.0 - 0.5) / 0.5  # Normalize to [-1, 1]
+            tensor = tensor.to(self.device)
+
+            # Get embeddings
+            embeddings = self.model.get_embeddings(tensor)
+            return embeddings.cpu().numpy().flatten()
+
+
+def get_transforms(train=True):
+    """Get image transforms for training/validation"""
     if train:
         return transforms.Compose([
             transforms.Resize((224, 224)),
-            # Event frame friendly augmentations
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(degrees=10),  # Reduced for event frames
-            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),  # Gentle transforms
+            transforms.RandomRotation(degrees=10),
+            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5], std=[0.5])  # CHANGED: Single channel normalization
+            transforms.Normalize(mean=[0.5], std=[0.5])
         ])
     else:
         return transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5], std=[0.5])  # CHANGED: Single channel normalization
+            transforms.Normalize(mean=[0.5], std=[0.5])
         ])
 
 
-# --------------------------
-# VISUALIZATION HELPER (UPDATED FOR GRAYSCALE)
-# --------------------------
-def visualize_reconstructions(model, val_loader, device, num_samples=8):
-    """Visualize original vs reconstructed event frames"""
+def visualize_reconstructions(model, val_loader, device, save_path, num_samples=8):
+    """Visualize original vs reconstructed images"""
     model.eval()
 
-    # Get a batch of validation data
+    # Get sample data
     data_iter = iter(val_loader)
-    images, labels = next(data_iter)
+    images, _ = next(data_iter)
     images = images[:num_samples].to(device)
 
     with torch.no_grad():
-        embeddings, reconstructed = model(images)
+        _, reconstructed = model(images)
 
-    # CHANGED: Denormalize for grayscale visualization
+    # Denormalize
     mean = torch.tensor([0.5]).view(1, 1, 1, 1).to(device)
     std = torch.tensor([0.5]).view(1, 1, 1, 1).to(device)
 
-    original_denorm = images * std + mean
-    reconstructed_denorm = reconstructed * std + mean
-
-    # Clamp to [0, 1]
-    original_denorm = torch.clamp(original_denorm, 0, 1)
-    reconstructed_denorm = torch.clamp(reconstructed_denorm, 0, 1)
+    original = torch.clamp(images * std + mean, 0, 1)
+    reconstructed = torch.clamp(reconstructed * std + mean, 0, 1)
 
     # Create visualization
     fig, axes = plt.subplots(2, num_samples, figsize=(num_samples * 2, 4))
 
     for i in range(num_samples):
-        # CHANGED: Handle grayscale images properly
-        orig_img = original_denorm[i].cpu().squeeze().numpy()  # Remove channel dimension
-        axes[0, i].imshow(orig_img, cmap='gray')  # Use gray colormap
-        axes[0, i].set_title('Original Event Frame')
+        orig_img = original[i].cpu().squeeze().numpy()
+        axes[0, i].imshow(orig_img, cmap='gray')
+        axes[0, i].set_title('Original')
         axes[0, i].axis('off')
 
-        # Reconstructed event frame
-        recon_img = reconstructed_denorm[i].cpu().squeeze().numpy()  # Remove channel dimension
-        axes[1, i].imshow(recon_img, cmap='gray')  # Use gray colormap
+        recon_img = reconstructed[i].cpu().squeeze().numpy()
+        axes[1, i].imshow(recon_img, cmap='gray')
         axes[1, i].set_title('Reconstructed')
         axes[1, i].axis('off')
 
     plt.tight_layout()
-    plt.savefig(RESULTS_DIR+'reconstruction_samples.png', dpi=150, bbox_inches='tight')
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
 
 
-# --------------------------
-# TRAINING FUNCTION (UPDATED FOR EVENT FRAMES)
-# --------------------------
-def train_model():
-    print(f"Using device: {device}")
-    print("🎯 Configuring for EVENT FRAMES (grayscale)")
+def train_model(data_root, results_dir, config=None):
+    """Train the autoencoder model"""
+    # Default configuration
+    default_config = {
+        'batch_size': 32,
+        'num_epochs': 50,
+        'lr': 1e-3,
+        'weight_decay': 1e-4,
+        'embedding_dim': 512,
+        'patience': 10
+    }
 
-    # CHANGED: Event frames are always grayscale - set to 1 channel
-    input_channels = 1
-    print(f"✓ Using {input_channels} input channel for event frames")
+    if config:
+        default_config.update(config)
+
+    cfg = default_config
+
+    # Setup device
+    device = torch.device(
+        "mps" if torch.backends.mps.is_available()
+        else "cuda" if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    print(f"Using device: {device}")
+    os.makedirs(results_dir, exist_ok=True)
 
     # Get class names
-    class_names = sorted([d for d in os.listdir(DATA_ROOT)
-                          if os.path.isdir(os.path.join(DATA_ROOT, d)) and not d.startswith('.')])
+    class_names = sorted([d for d in os.listdir(data_root)
+                          if os.path.isdir(os.path.join(data_root, d)) and not d.startswith('.')])
+    class_to_idx = {name: idx for idx, name in enumerate(class_names)}
     print(f"Found {len(class_names)} classes: {class_names}")
 
-    class_to_idx = {class_name: idx for idx, class_name in enumerate(class_names)}
-
     # Create datasets
-    train_dataset = EventDataset(DATA_ROOT, class_to_idx, transform=get_event_transforms(train=True))
-    val_dataset = EventDataset(DATA_ROOT, class_to_idx, transform=get_event_transforms(train=False))
+    full_dataset = EventDataset(data_root, class_to_idx, transform=get_transforms(train=True))
 
     # Split dataset
-    train_size = int(0.8 * len(train_dataset))
-    val_size = len(train_dataset) - train_size
-    train_dataset, _ = torch.utils.data.random_split(train_dataset, [train_size, val_size])
-    val_dataset, _ = torch.utils.data.random_split(val_dataset, [val_size, len(val_dataset) - val_size])
+    train_size = int(0.8 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(full_dataset, [train_size, val_size])
 
     # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=cfg['batch_size'], shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=cfg['batch_size'], shuffle=False, num_workers=4)
 
-    # CHANGED: Initialize model with 1 input channel for event frames
-    model = AutoencoderClassifier(embedding_dim=embedding_dim,
-                                 input_channels=input_channels).to(device)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-    # Optimizers and schedulers
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # Initialize model
+    model = AutoencoderClassifier(embedding_dim=cfg['embedding_dim']).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg['lr'], weight_decay=cfg['weight_decay'])
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.1)
-
-    # Loss functions
-    reconstruction_criterion = nn.MSELoss()
+    criterion = nn.MSELoss()
 
     # Training loop
-    patience = 10
+    best_val_loss = float('inf')
     patience_counter = 0
-    best_val_recon_loss = None
+    train_losses, val_losses = [], []
 
-    train_losses = []
-    val_losses = []
-
-    for epoch in range(num_epochs):
+    for epoch in range(cfg['num_epochs']):
         # Training phase
         model.train()
         train_loss = 0.0
-        train_recon_loss = 0.0
 
-        train_loop = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Train]")
-
-        for batch_idx, (images, labels) in enumerate(train_loop):
-            images, labels = images.to(device), labels.to(device)
+        for images, _ in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{cfg['num_epochs']}"):
+            images = images.to(device)
 
             optimizer.zero_grad()
+            _, reconstructed = model(images)
+            loss = criterion(reconstructed, images)
+            loss.backward()
 
-            # Forward pass
-            embeddings, reconstructed = model(images)
-
-            # Calculate losses
-            recon_loss = reconstruction_criterion(reconstructed, images)
-
-            recon_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            train_loop.set_postfix(
-                recon_loss=recon_loss.item(),
-                acc=0
-            )
+            train_loss += loss.item()
 
-        # Validation phase (reconstruction only)
+        # Validation phase
         model.eval()
-        val_recon_loss = 0.0
-        val_total = 0
+        val_loss = 0.0
 
         with torch.no_grad():
-            for images, labels in tqdm(val_loader, desc=f"Epoch {epoch + 1}/{num_epochs} [Val]"):
+            for images, _ in val_loader:
                 images = images.to(device)
+                _, reconstructed = model(images)
+                loss = criterion(reconstructed, images)
+                val_loss += loss.item()
 
-                embeddings, reconstructed = model(images)[:2]  # Only use embeddings and reconstructed
+        train_loss /= len(train_loader)
+        val_loss /= len(val_loader)
 
-                recon_loss = reconstruction_criterion(reconstructed, images)
-                val_recon_loss += recon_loss.item() * images.size(0)
-                val_total += images.size(0)
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
 
-        avg_val_recon_loss = val_recon_loss / val_total
-        print(f"Validation Reconstruction Loss: {avg_val_recon_loss:.4f}")
+        print(f"Epoch {epoch + 1}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
 
         scheduler.step()
 
-        # Store metrics
-        train_losses.append(train_loss / len(train_loader))
-        val_losses.append(avg_val_recon_loss)
-
-        print(f"Epoch {epoch + 1}/{num_epochs}:")
-        print(
-            f"  Train - Total: {train_loss / len(train_loader):.4f}, Recon: {train_recon_loss / len(train_loader):.4f}")
-        print(
-            f"  Val - Total: {avg_val_recon_loss:.4f}, Recon: {val_recon_loss / len(val_loader):.4f}%")
-
-        # Early stopping and model saving (using validation reconstruction loss)
-        if best_val_recon_loss is None or avg_val_recon_loss < best_val_recon_loss:
-            best_val_recon_loss = avg_val_recon_loss
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             patience_counter = 0
+
             torch.save({
                 'model_state_dict': model.state_dict(),
                 'epoch': epoch,
-                'embedding_dim': embedding_dim,
-                # add other metadata as needed
-            }, os.path.join(RESULTS_DIR, "best_autoencoder.pth"))
-            print(f"  ✅ New best model saved! Val Recon Loss: {avg_val_recon_loss:.4f}")
-            visualize_reconstructions(model, val_loader, device)
+                'embedding_dim': cfg['embedding_dim'],
+                'val_loss': val_loss
+            }, os.path.join(results_dir, "best_model.pth"))
+
+            # Visualize reconstructions
+            visualize_reconstructions(model, val_loader, device,
+                                      os.path.join(results_dir, 'reconstructions.png'))
+            print(f"  ✅ New best model saved! Val Loss: {val_loss:.4f}")
         else:
             patience_counter += 1
-            if patience_counter >= patience:
-                print(f"Early stopping triggered after {patience} epochs without improvement")
+            if patience_counter >= cfg['patience']:
+                print(f"Early stopping after {cfg['patience']} epochs without improvement")
                 break
 
-    # Final evaluation
-    checkpoint = torch.load(os.path.join(RESULTS_DIR, "best_autoencoder.pth"))
+    # Save final artifacts
+    model_dir = os.path.join(results_dir, "final_model")
+    os.makedirs(model_dir, exist_ok=True)
+
+    # Load best model
+    checkpoint = torch.load(os.path.join(results_dir, "best_model.pth"))
     model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
+    torch.save(model.state_dict(), os.path.join(model_dir, "model.pth"))
 
-    # Final predictions
-    all_labels = []
-    all_embeddings = []
-    with torch.no_grad():
-        for images, labels in tqdm(val_loader, desc="Final Evaluation"):
-            images = images.to(device)
-            embeddings, _ = model(images)
-            all_embeddings.extend(embeddings.cpu().numpy())
+    # Save training info
+    training_info = {
+        **cfg,
+        'input_channels': 1,
+        'data_type': 'event_frames_grayscale',
+        'best_val_loss': best_val_loss,
+        'class_names': class_names
+    }
 
-    # Save final model and embeddings
-    os.makedirs(RESULTS_DIR+"autoencoder-trained", exist_ok=True)
-    torch.save(model.state_dict(), RESULTS_DIR+"autoencoder-trained/model.pth")
-
-    # Save embeddings
-    np.save(RESULTS_DIR+"autoencoder-trained/embeddings.npy", np.array(all_embeddings))
-    np.save(RESULTS_DIR+"autoencoder-trained/labels.npy", np.array(all_labels))
-
-    # Save training info with updated metadata
-    with open(os.path.join(RESULTS_DIR, "autoencoder-trained/training_info.json"), "w") as f:
-        json.dump({
-            "num_epochs": num_epochs,
-            "batch_size": batch_size,
-            "learning_rate": lr,
-            "embedding_dim": embedding_dim,
-            "reconstruction_weight": reconstruction_weight,
-            "input_channels": input_channels,  # ADDED
-            "data_type": "event_frames_grayscale"  # ADDED
-        }, f, indent=2)
+    with open(os.path.join(model_dir, "training_info.json"), "w") as f:
+        json.dump(training_info, f, indent=2)
 
     # Plot training curves
-    plt.figure(figsize=(12, 4))
-
+    plt.figure(figsize=(10, 5))
     plt.plot(train_losses, label='Train Loss')
-    plt.plot(val_losses, label='Val Loss')
-    plt.title('Training and Validation Loss (Event Frames)')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.title('Training Curves')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
-
-    plt.tight_layout()
-    plt.savefig(RESULTS_DIR+'autoencoder-trained/training_curves.png', dpi=150, bbox_inches='tight')
+    plt.savefig(os.path.join(model_dir, 'training_curves.png'), dpi=150, bbox_inches='tight')
     plt.close()
 
-    print("✅ Event frame model, embeddings, and training info saved to 'autoencoder-trained'")
+    print(f"✅ Training complete! Model saved to: {model_dir}")
+    return model, training_info
 
 
-if __name__ == '__main__':
-    train_model()
+# Example usage
+if __name__ == "__main__":
+    # Update these paths to your actual data locations
+    DATA_ROOT = '/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/bboxes/'
+    RESULTS_DIR = '/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/resultsbbox30050epochs/'
 
-    # # load the model and pass dummy data through get_embeddings()
-    # model_path = "/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/resultsbbox30050epochs/autoencoder-trained/model.pth"
-    # device = torch.device("mps")
-    # model = AutoencoderClassifier(embedding_dim=512).to(device)
-    #
-    # # Load trained weights
-    # state_dict = torch.load(model_path, map_location=device)
-    # model.load_state_dict(state_dict)
-    # model.eval()
-    #
-    # print(f"✅ Model loaded from: {model_path}")
-    #
-    # # pass some dummy data through
-    # x = torch.randn(224, 224).float().unsqueeze(0).unsqueeze(0).to(device)  # single grayscale image
-    # print(x.shape)  # Should print: torch.Size([1, 1, 224, 224])
-    # embeddings = model.get_embeddings(x)
-    # print(embeddings.shape)
+    # Custom configuration (optional)
+    config = {
+        'num_epochs': 50,
+        'batch_size': 32,
+        'lr': 1e-3,
+        'embedding_dim': 512
+    }
+
+    # Train model
+    model, info = train_model(DATA_ROOT, RESULTS_DIR, config)
+
+    # Use embedding extractor
+    extractor = EventFrameEmbeddingExtractor(
+        model_path=os.path.join(RESULTS_DIR, "final_model/model.pth"),
+        info_path=os.path.join(RESULTS_DIR, "final_model/training_info.json")
+    )
+
+    # Extract embeddings from a sample image
+    sample_image = np.random.randint(0, 255, (224, 224), dtype=np.uint8)
+    embeddings = extractor.get_embeddings(sample_image)
+    print(f"Embeddings shape: {embeddings.shape}")

@@ -1,54 +1,32 @@
+"""
+Event Frame Processing Pipeline
+Processes event frames using attention mechanisms and extracts features using trained autoencoder
+"""
+
+import os
 import numpy as np
-from attention_helpers import initialise_attention, run_attention
-from oms_helpers import initialize_oms, egomotion
 import torch
 import cv2
-import os
-from natsort import natsorted
 from PIL import Image
 import torchvision.transforms as T
 import matplotlib
-
-matplotlib.use('Agg')  # Use Agg backend (no GUI)
-
-# Add missing imports for the model
-import torch.nn as nn
-import torch.nn.functional as F
-
-# Add the EmbeddingExtractor import - REMOVED, using direct model loading
-from load_model import EmbeddingExtractor
-from load_model import EmbeddingExtractor
-
+from natsort import natsorted
 import sspspace
-import torchvision.transforms as transforms
 
-# FIXED: Transform to match your EVENT FRAME training (single channel grayscale)
-event_transform = transforms.Compose([
-    transforms.ToPILImage(),
-    transforms.Grayscale(),  # Single channel grayscale (not 3-channel)
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5], std=[0.5])  # Single channel normalization like your training
-])
+# Local imports
+from attention_helpers import initialise_attention, run_attention
+from oms_helpers import initialize_oms, egomotion
+from load_model import EmbeddingExtractor
 
-transform = T.Compose([
-    T.Grayscale(),
-    T.ToTensor(),
-])
-
-
-# UPDATED: Use your actual model paths
-MODEL_PATH = "/media/matt/bigdata/DATA/CRIB/resultsbbox30050epochs/autoencoder-trained/model.pth"
-INFO_PATH = "/media/matt/bigdata/DATA/CRIB/resultsbbox30050epochs/autoencoder-trained/training_info.json"
-
-#ROOT = '/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/'
-ROOT = '/media/matt/bigdata/DATA/CRIB/'
-PATH_DATA = ROOT + 'train_event_frames/'  # Use original event frames
-MEMORY_SAVE_PATH = ROOT + 'workingmemorybbox30050epochs/'
+matplotlib.use('Agg')  # No GUI backend
 
 
 class Config:
+    """Configuration parameters for the processing pipeline"""
+
     MAX_X, MAX_Y = 128, 128
+    BOX_SIZE = 350
+    GAMMA = 0.99  # Memory update factor
 
     OMS_PARAMS = {
         'size_krn_center': 8,
@@ -78,195 +56,218 @@ class Config:
     }
 
 
-def load_trained_model(device="cpu"):
-    """Load the trained autoencoder model via EmbeddingExtractor"""
-    try:
-        model = EmbeddingExtractor(
-            model_path=MODEL_PATH,
-            info_path=INFO_PATH
-        )
+class EventFrameProcessor:
+    """Main processor for event frames with attention and memory encoding"""
 
-        print(f"✅ Loaded EmbeddingExtractor successfully!")
-        return model
+    def __init__(self, model_path, info_path=None, device=None):
+        self.config = Config()
 
-    except Exception as e:
-        print(f"Failed to load EmbeddingExtractor: {e}")
-        print("Make sure these files exist:")
-        print(f"  - {MODEL_PATH}")
-        print(f"  - {INFO_PATH}")
-        return None
+        # Setup device
+        if device is None:
+            self.device = torch.device(
+                "mps" if torch.backends.mps.is_available()
+                else "cuda" if torch.cuda.is_available()
+                else "cpu"
+            )
+        else:
+            self.device = device
 
+        print(f"Using device: {self.device}")
 
-def main():
-    """Recreate your original pipeline exactly - process evframes with attention to get proper coordinates"""
+        # Load model
+        self.model = self._load_model(model_path, info_path)
 
-    # Device setup (exactly like your original)
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"Using device: {device}")
-    config = Config()
-    OMSFLAG = False
+        # Initialize networks
+        self.net_attention = initialise_attention(self.device, self.config.ATTENTION_PARAMS)
 
-    # Load trained model
-    model = load_trained_model(device=device)
-    if model is None:
-        return
+        # Initialize transforms
+        self.transform = T.Compose([
+            T.Grayscale(),
+            T.ToTensor(),
+        ])
 
-    # Create directories
-    os.makedirs(MEMORY_SAVE_PATH, exist_ok=True)
+        # Initialize coordinate encoder
+        self.coord_encoder = sspspace.RandomSSPSpace(domain_dim=2, ssp_dim=512)
 
-    # Initialize networks (exactly like your original)
-    if OMSFLAG:
-        net_center, net_surround = initialize_oms(device, config.OMS_PARAMS)
-    net_attention = initialise_attention(device, config.ATTENTION_PARAMS)
+    def _load_model(self, model_path, info_path):
+        """Load the trained autoencoder model"""
+        try:
+            model = EmbeddingExtractor(
+                model_path=model_path,
+                info_path=info_path
+            )
+            print(f"✅ Model loaded successfully: {type(model).__name__}")
+            return model
+        except Exception as e:
+            print(f"❌ Failed to load model: {e}")
+            print(f"Model path: {model_path}")
+            if info_path:
+                print(f"Info path: {info_path}")
+            raise
 
-    # Get objects (exactly like your original)
-    objects = natsorted([d for d in os.listdir(PATH_DATA)
-                         if os.path.isdir(os.path.join(PATH_DATA, d))])
+    def process_frame(self, img_path, saliency_map, resolution):
+        """Process a single event frame and return attention coordinates and features"""
+        try:
+            # Load and preprocess image
+            img = Image.open(img_path)
+            window = self.transform(img)
 
-    print(f"Found {len(objects)} objects to process: {objects}")
+            # Run attention mechanism
+            saliency_map[:], salmax_coords = run_attention(
+                window, self.net_attention, self.device,
+                resolution, self.config.ATTENTION_PARAMS['num_pyr']
+            )
 
-    # Process each object (exactly like your original loop)
-    for obj in objects:
-        print(f"\nProcessing object: {obj}")
+            # Convert to displayable format
+            window_img = window.detach().cpu().numpy().squeeze(0)
+            window_img = (window_img * 255).clip(0, 255).astype(np.uint8)
 
-        # Initialize variables (exactly like your original)
+            # Extract ROI coordinates
+            x, y = salmax_coords[1], salmax_coords[0]
+            x1 = max(x - self.config.BOX_SIZE // 2, 0)
+            y1 = max(y - self.config.BOX_SIZE // 2, 0)
+            x2 = min(x + self.config.BOX_SIZE // 2, window_img.shape[1])
+            y2 = min(y + self.config.BOX_SIZE // 2, window_img.shape[0])
+
+            # Extract ROI and get features
+            roi_crop = window_img[y1:y2, x1:x2]
+
+            with torch.no_grad():
+                image_features = self.model.get_embeddings(roi_crop)
+
+            # Create spatial encoding
+            roi_center = self.coord_encoder.encode([[x, y]])
+            img_feat_ssp = sspspace.SSP(image_features)
+            new_roi = roi_center * img_feat_ssp
+
+            return new_roi, image_features, (x, y)
+
+        except Exception as e:
+            print(f"    Error processing frame {os.path.basename(img_path)}: {e}")
+            return None, None, None
+
+    def process_object(self, obj_path, obj_name):
+        """Process all frames for a single object"""
+        print(f"\nProcessing object: {obj_name}")
+
+        # Setup processing variables
         max_x, max_y = 400, 400
         resolution = (max_y, max_x)
-        box_size = 350
-        if OMSFLAG:
-            size_krn_after_oms = 343
-            OMS = np.zeros((size_krn_after_oms, size_krn_after_oms), dtype=np.float32)
-            vSliceOMS = torch.zeros((1, size_krn_after_oms, size_krn_after_oms), dtype=torch.float32).to(device)
         saliency_map = np.zeros((max_y, max_x), dtype=np.float32)
-        salmax_coords = np.zeros((2,), dtype=np.int32)
 
-        # Initialize coordinate encoder (exactly like your original) - spatial semantic pointer
-        coord_encoder = sspspace.RandomSSPSpace(domain_dim=2, ssp_dim=512)
+        # Initialize object memory
+        object_memory = self.coord_encoder.encode([[0, 0]])
+        last_features = None
 
-        # Initialize object memory (exactly like your original)
-        object_memory = coord_encoder.encode([[0, 0]])
-
-        # Get path to object's event frames
-        obj_path_data = os.path.join(PATH_DATA, obj)
-
-        # Get all event frame files (exactly like your original)
-        data_files = natsorted([f for f in os.listdir(obj_path_data)
-                                if os.path.isfile(os.path.join(obj_path_data, f)) and f != '.DS_Store'])
+        # Get all event frame files
+        data_files = natsorted([
+            f for f in os.listdir(obj_path)
+            if os.path.isfile(os.path.join(obj_path, f)) and f != '.DS_Store'
+        ])
 
         print(f"  Processing {len(data_files)} event frames...")
 
-        # Process each event frame (exactly like your original)
-        for data_file_i in data_files:
-            img_path = os.path.join(obj_path_data, data_file_i)
+        processed_count = 0
+        for data_file in data_files:
+            img_path = os.path.join(obj_path, data_file)
 
-            try:
-                # Load and preprocess image (exactly like your original)
-                img = Image.open(img_path)
-                window = transform(img)
-                window_original = window
+            # Process frame
+            new_roi, image_features, coords = self.process_frame(
+                img_path, saliency_map, resolution
+            )
 
-                # # Computing egomotion (exactly like your original)
-                # wOMS = torch.tensor(window, dtype=torch.float32).to(device)
-                # OMS, indexes = egomotion(wOMS, net_center, net_surround, device, config.MAX_Y,
-                #                          config.MAX_X, config.OMS_PARAMS['threshold'])
-                #
-                # # Dynamically get the actual OMS size (no more hardcoding!)
-                # if vSliceOMS is None:
-                #     # Initialize vSliceOMS based on actual OMS output size
-                #     oms_shape = OMS.shape
-                #     print(f"    Detected OMS output shape: {oms_shape}")
-                #     if len(oms_shape) == 4:  # [batch, channel, height, width]
-                #         vSliceOMS = torch.zeros((1, oms_shape[2], oms_shape[3]), dtype=torch.float32).to(device)
-                #     elif len(oms_shape) == 3:  # [channel, height, width]
-                #         vSliceOMS = torch.zeros((1, oms_shape[1], oms_shape[2]), dtype=torch.float32).to(device)
-                #     else:
-                #         print(f"    Unexpected OMS shape: {oms_shape}")
-                #         vSliceOMS = torch.zeros_like(OMS.squeeze(0) if len(oms_shape) > 3 else OMS).to(device)
-                #
-                # vSliceOMS = OMS.squeeze(0)
+            if new_roi is not None:
+                # Update memory
+                object_memory = (self.config.GAMMA * object_memory +
+                                 (1 - self.config.GAMMA) * new_roi)
+                last_features = image_features
+                processed_count += 1
 
-                # Run attention mechanism (exactly like your original)
-                saliency_map[:], salmax_coords[:] = run_attention(
-                    window, net_attention, device, resolution, config.ATTENTION_PARAMS['num_pyr']
-                )
+            # Memory cleanup
+            self._cleanup_memory()
+            saliency_map.fill(0)
 
-                # Convert window to displayable format (exactly like your original)
-                window_img = window.detach().cpu().numpy().squeeze(0)
-                window_img = (window_img * 255).clip(0, 255).astype(np.uint8)
-                window_img_color = cv2.cvtColor(window_img, cv2.COLOR_GRAY2BGR)
+        print(f"  Successfully processed {processed_count}/{len(data_files)} frames")
+        return object_memory, last_features
 
-                # Get coordinates (exactly like your original)
-                x, y = salmax_coords[1], salmax_coords[0]
-                x1, y1 = max(x - box_size // 2, 0), max(y - box_size // 2, 0)
-                x2, y2 = min(x + box_size // 2, window_img.shape[1]), min(y + box_size // 2, window_img.shape[0])
+    def _cleanup_memory(self):
+        """Clean up GPU memory"""
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-                # Create ROI center encoding (exactly like your original)
-                roi_center = coord_encoder.encode([[x, y]])
+    def save_results(self, obj_name, object_memory, image_features, save_path):
+        """Save processing results"""
+        os.makedirs(save_path, exist_ok=True)
 
-                # Extract features from ROI (updated to use your trained model with proper grayscale)
-                roi_crop_gray = window_img[y1:y2, x1:x2]  # Keep as grayscale
-                roi_tensor = event_transform(roi_crop_gray)
+        memory_file = os.path.join(save_path, f'{obj_name}_memory.npy')
+        features_file = os.path.join(save_path, f'{obj_name}_image_features.npy')
 
-                ######## we have a mismatch of the size
-
-
-                with torch.no_grad():
-                    # Convert tensor to numpy format expected by EmbeddingExtractor
-                    roi_for_model = roi_tensor.detach().cpu().numpy()
-                    #
-                    # # Denormalize from [-1,1] to [0,255] and convert to uint8
-                    # roi_for_model = ((roi_for_model + 1) * 127.5).astype(np.uint8)
-
-                    print("ROI shape", roi_for_model.shape)
-
-                    # Get embeddings using your trained model
-                    image_features = model.get_embeddings(roi_for_model)
-
-                    # Ensure features are 1D and normalized
-                    if len(image_features.shape) > 1:
-                        image_features = image_features.flatten()
-                    image_features = image_features / (np.linalg.norm(image_features) + 1e-8)
-
-                # Create SSP and update memory (exactly like your original)
-                img_feat_ssp = sspspace.SSP(image_features)
-                new_roi = roi_center * img_feat_ssp
-                gamma = 0.99  # Same as your original
-                object_memory = gamma * object_memory + (1 - gamma) * new_roi
-
-            except Exception as e:
-                print(f"    Error processing {data_file_i}: {e}")
-                continue
-
-            finally:
-                # Clean up memory (exactly like your original)
-                del window
-                if torch.backends.mps.is_available():
-                    torch.mps.empty_cache()
-                elif torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-                # Reset for next frame (exactly like your original)
-                window = torch.zeros((1, max_y, max_x), dtype=torch.float32)
-                saliency_map = np.zeros((max_y, max_x), dtype=np.float32)
-
-        # Save results (exactly like your original)
-        print(f"  Saving memory for {obj}...")
-
-        # Save the final consolidated memory (exactly like your original)
-        memory_file = os.path.join(MEMORY_SAVE_PATH, f'{obj}_memory.npy')
         np.save(memory_file, object_memory)
+        if image_features is not None:
+            np.save(features_file, image_features)
 
-        # Save the final image features (exactly like your original)
-        features_file = os.path.join(MEMORY_SAVE_PATH, f'{obj}_image_features.npy')
-        np.save(features_file, image_features)
+        print(f"  ✅ Saved {obj_name} memory and features")
 
-        print(f"  ✅ Saved {obj} memory and features with proper coordinates")
 
-    print(f"\n✅ All objects processed successfully!")
-    print(f"Working memory saved to: {MEMORY_SAVE_PATH}")
+def main():
+    """Main processing pipeline"""
+
+    # Configuration paths
+    MODEL_PATH = "/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/resultsbbox30050epochs/final_model/model.pth"
+    INFO_PATH = "/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/resultsbbox30050epochs/final_model/training_info.json"
+
+    ROOT = '/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/'
+    PATH_DATA = ROOT + 'evframes/'
+    MEMORY_SAVE_PATH = ROOT + 'workingmemorybbox30050epochs/'
+
+    # Validate paths
+    if not os.path.exists(MODEL_PATH):
+        print(f"❌ Model path does not exist: {MODEL_PATH}")
+        return
+
+    if not os.path.exists(PATH_DATA):
+        print(f"❌ Data path does not exist: {PATH_DATA}")
+        return
+
+    # Initialize processor
+    try:
+        processor = EventFrameProcessor(MODEL_PATH, INFO_PATH)
+    except Exception as e:
+        print(f"❌ Failed to initialize processor: {e}")
+        return
+
+    # Get objects to process
+    objects = natsorted([
+        d for d in os.listdir(PATH_DATA)
+        if os.path.isdir(os.path.join(PATH_DATA, d)) and not d.startswith('.')
+    ])
+
+    if not objects:
+        print(f"❌ No objects found in {PATH_DATA}")
+        return
+
+    print(f"Found {len(objects)} objects to process: {objects}")
+
+    # Process each object
+    success_count = 0
+    for obj in objects:
+        obj_path = os.path.join(PATH_DATA, obj)
+
+        try:
+            object_memory, image_features = processor.process_object(obj_path, obj)
+            processor.save_results(obj, object_memory, image_features, MEMORY_SAVE_PATH)
+            success_count += 1
+
+        except Exception as e:
+            print(f"❌ Failed to process object {obj}: {e}")
+            continue
+
+    print(f"\n✅ Processing complete!")
+    print(f"Successfully processed: {success_count}/{len(objects)} objects")
+    print(f"Results saved to: {MEMORY_SAVE_PATH}")
 
 
 if __name__ == '__main__':
     main()
-
-    #### check from here you need to understand if the model I am loading is the one I trained before

@@ -1,0 +1,31 @@
+{
+  "overall_accuracy": 0.35,
+  "verdict": "POOR",
+  "class_accuracies": {
+    "android": 0.1,
+    "anger": 1.0,
+    "apple": 0.0,
+    "baby": 0.0,
+    "baby_dino": 0.2,
+    "baby_rattle": 0.05,
+    "badminton_racket": 0.9,
+    "bag": 0.1,
+    "balls": 0.15,
+    "banana": 1.0
+  },
+  "total_samples": 200,
+  "best_classes": [
+    "anger",
+    "badminton_racket",
+    "banana"
+  ],
+  "worst_classes": [
+    "android",
+    "apple",
+    "baby",
+    "baby_dino",
+    "baby_rattle",
+    "bag",
+    "balls"
+  ]
+}

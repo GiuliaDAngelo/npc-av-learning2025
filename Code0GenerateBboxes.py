@@ -25,9 +25,14 @@ transform = T.Compose([
 ])
 
 
+# ROOT = '/media/matt/bigdata/DATA/CRIB/'
+# SOURCE_PATH = ROOT + 'train_event_frames/'
+# BBOX_BASE_PATH = ROOT + 'bboxes/'
+
 ROOT = '/media/matt/bigdata/DATA/CRIB/'
 SOURCE_PATH = ROOT + 'train_event_frames/'
 BBOX_BASE_PATH = ROOT + 'bboxes/'
+
 BATCH_SIZE = 64
 WIDTH, HEIGHT = 400, 400
 ROI_SIZE = 100  # Fixed size for bounding boxes
