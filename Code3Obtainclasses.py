@@ -23,7 +23,6 @@ INFO_PATH = "/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_dat
 BBOX_DIR = "/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/bboxes/"
 MEMORY_DIR = "/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/workingmemorybbox30050epochs/"
 
-
 def get_model_classes():
     """Get the actual classes the model was trained on"""
     try:
