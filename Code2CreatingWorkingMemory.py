@@ -1,4 +1,5 @@
 import numpy as np
+import tqdm
 from attention_helpers import initialise_attention, run_attention
 from oms_helpers import initialize_oms, egomotion
 import torch
@@ -156,98 +157,91 @@ def main():
         print(f"  Processing {len(data_files)} event frames...")
 
         # Process each event frame (exactly like your original)
-        for data_file_i in data_files:
+        for data_file_i in tqdm.tqdm(data_files):
             img_path = os.path.join(obj_path_data, data_file_i)
 
-            try:
-                # Load and preprocess image (exactly like your original)
-                img = Image.open(img_path)
-                window = transform(img)
-                window_original = window
+            # Load and preprocess image (exactly like your original)
+            img = Image.open(img_path)
+            window = transform(img)
+            window_original = window
 
-                # # Computing egomotion (exactly like your original)
-                # wOMS = torch.tensor(window, dtype=torch.float32).to(device)
-                # OMS, indexes = egomotion(wOMS, net_center, net_surround, device, config.MAX_Y,
-                #                          config.MAX_X, config.OMS_PARAMS['threshold'])
+            # # Computing egomotion (exactly like your original)
+            # wOMS = torch.tensor(window, dtype=torch.float32).to(device)
+            # OMS, indexes = egomotion(wOMS, net_center, net_surround, device, config.MAX_Y,
+            #                          config.MAX_X, config.OMS_PARAMS['threshold'])
+            #
+            # # Dynamically get the actual OMS size (no more hardcoding!)
+            # if vSliceOMS is None:
+            #     # Initialize vSliceOMS based on actual OMS output size
+            #     oms_shape = OMS.shape
+            #     print(f"    Detected OMS output shape: {oms_shape}")
+            #     if len(oms_shape) == 4:  # [batch, channel, height, width]
+            #         vSliceOMS = torch.zeros((1, oms_shape[2], oms_shape[3]), dtype=torch.float32).to(device)
+            #     elif len(oms_shape) == 3:  # [channel, height, width]
+            #         vSliceOMS = torch.zeros((1, oms_shape[1], oms_shape[2]), dtype=torch.float32).to(device)
+            #     else:
+            #         print(f"    Unexpected OMS shape: {oms_shape}")
+            #         vSliceOMS = torch.zeros_like(OMS.squeeze(0) if len(oms_shape) > 3 else OMS).to(device)
+            #
+            # vSliceOMS = OMS.squeeze(0)
+
+            # Run attention mechanism (exactly like your original)
+            saliency_map[:], salmax_coords[:] = run_attention(
+                window, net_attention, device, resolution, config.ATTENTION_PARAMS['num_pyr']
+            )
+
+            # Convert window to displayable format (exactly like your original)
+            window_img = window.detach().cpu().numpy().squeeze(0)
+            window_img = (window_img * 255).clip(0, 255).astype(np.uint8)
+            window_img_color = cv2.cvtColor(window_img, cv2.COLOR_GRAY2BGR)
+
+            # Get coordinates (exactly like your original)
+            x, y = salmax_coords[1], salmax_coords[0]
+            x1, y1 = max(x - box_size // 2, 0), max(y - box_size // 2, 0)
+            x2, y2 = min(x + box_size // 2, window_img.shape[1]), min(y + box_size // 2, window_img.shape[0])
+
+            # Create ROI center encoding (exactly like your original)
+            roi_center = coord_encoder.encode([[x, y]])
+
+            # Extract features from ROI (updated to use your trained model with proper grayscale)
+            roi_crop_gray = window_img[y1:y2, x1:x2]  # Keep as grayscale
+            roi_tensor = event_transform(roi_crop_gray)
+
+            with torch.no_grad():
+                # Convert tensor to numpy format expected by EmbeddingExtractor
+                roi_for_model = roi_tensor.detach().cpu().numpy()
+
+                # squeeze the first dimension
+                roi_for_model = np.squeeze(roi_for_model, axis=0)
+
                 #
-                # # Dynamically get the actual OMS size (no more hardcoding!)
-                # if vSliceOMS is None:
-                #     # Initialize vSliceOMS based on actual OMS output size
-                #     oms_shape = OMS.shape
-                #     print(f"    Detected OMS output shape: {oms_shape}")
-                #     if len(oms_shape) == 4:  # [batch, channel, height, width]
-                #         vSliceOMS = torch.zeros((1, oms_shape[2], oms_shape[3]), dtype=torch.float32).to(device)
-                #     elif len(oms_shape) == 3:  # [channel, height, width]
-                #         vSliceOMS = torch.zeros((1, oms_shape[1], oms_shape[2]), dtype=torch.float32).to(device)
-                #     else:
-                #         print(f"    Unexpected OMS shape: {oms_shape}")
-                #         vSliceOMS = torch.zeros_like(OMS.squeeze(0) if len(oms_shape) > 3 else OMS).to(device)
-                #
-                # vSliceOMS = OMS.squeeze(0)
+                # # Denormalize from [-1,1] to [0,255] and convert to uint8
+                # roi_for_model = ((roi_for_model + 1) * 127.5).astype(np.uint8)
 
-                # Run attention mechanism (exactly like your original)
-                saliency_map[:], salmax_coords[:] = run_attention(
-                    window, net_attention, device, resolution, config.ATTENTION_PARAMS['num_pyr']
-                )
+                # Get embeddings using your trained model
+                image_features = model.get_embeddings(roi_for_model)
 
-                # Convert window to displayable format (exactly like your original)
-                window_img = window.detach().cpu().numpy().squeeze(0)
-                window_img = (window_img * 255).clip(0, 255).astype(np.uint8)
-                window_img_color = cv2.cvtColor(window_img, cv2.COLOR_GRAY2BGR)
+                # Ensure features are 1D and normalized
+                if len(image_features.shape) > 1:
+                    image_features = image_features.flatten()
+                image_features = image_features / (np.linalg.norm(image_features) + 1e-8)
 
-                # Get coordinates (exactly like your original)
-                x, y = salmax_coords[1], salmax_coords[0]
-                x1, y1 = max(x - box_size // 2, 0), max(y - box_size // 2, 0)
-                x2, y2 = min(x + box_size // 2, window_img.shape[1]), min(y + box_size // 2, window_img.shape[0])
+            # Create SSP and update memory (exactly like your original)
+            img_feat_ssp = sspspace.SSP(image_features)
+            new_roi = roi_center * img_feat_ssp
+            gamma = 0.99  # Same as your original
+            object_memory = gamma * object_memory + (1 - gamma) * new_roi
 
-                # Create ROI center encoding (exactly like your original)
-                roi_center = coord_encoder.encode([[x, y]])
+            # Clean up memory (exactly like your original)
+            del window
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+            elif torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-                # Extract features from ROI (updated to use your trained model with proper grayscale)
-                roi_crop_gray = window_img[y1:y2, x1:x2]  # Keep as grayscale
-                roi_tensor = event_transform(roi_crop_gray)
-
-                ######## we have a mismatch of the size
-
-
-                with torch.no_grad():
-                    # Convert tensor to numpy format expected by EmbeddingExtractor
-                    roi_for_model = roi_tensor.detach().cpu().numpy()
-                    #
-                    # # Denormalize from [-1,1] to [0,255] and convert to uint8
-                    # roi_for_model = ((roi_for_model + 1) * 127.5).astype(np.uint8)
-
-                    print("ROI shape", roi_for_model.shape)
-
-                    # Get embeddings using your trained model
-                    image_features = model.get_embeddings(roi_for_model)
-
-                    # Ensure features are 1D and normalized
-                    if len(image_features.shape) > 1:
-                        image_features = image_features.flatten()
-                    image_features = image_features / (np.linalg.norm(image_features) + 1e-8)
-
-                # Create SSP and update memory (exactly like your original)
-                img_feat_ssp = sspspace.SSP(image_features)
-                new_roi = roi_center * img_feat_ssp
-                gamma = 0.99  # Same as your original
-                object_memory = gamma * object_memory + (1 - gamma) * new_roi
-
-            except Exception as e:
-                print(f"    Error processing {data_file_i}: {e}")
-                continue
-
-            finally:
-                # Clean up memory (exactly like your original)
-                del window
-                if torch.backends.mps.is_available():
-                    torch.mps.empty_cache()
-                elif torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-                # Reset for next frame (exactly like your original)
-                window = torch.zeros((1, max_y, max_x), dtype=torch.float32)
-                saliency_map = np.zeros((max_y, max_x), dtype=np.float32)
+            # Reset for next frame (exactly like your original)
+            window = torch.zeros((1, max_y, max_x), dtype=torch.float32)
+            saliency_map = np.zeros((max_y, max_x), dtype=np.float32)
 
         # Save results (exactly like your original)
         print(f"  Saving memory for {obj}...")

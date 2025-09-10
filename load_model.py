@@ -36,7 +36,7 @@ class EmbeddingExtractor:
         self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            transforms.Normalize(mean=[0.5], std=[0.5])
         ])
 
         print("✅ Embedding extractor ready!")
@@ -79,7 +79,7 @@ class EmbeddingExtractor:
         Preprocess numpy array image for the model
 
         Args:
-            image_array: numpy array of shape (H, W, 3) with values 0-255
+            image_array: numpy array of shape (H, W, 1) with values 0-255
 
         Returns:
             torch.Tensor: Preprocessed image tensor
@@ -100,6 +100,7 @@ class EmbeddingExtractor:
 
         # Apply preprocessing
         image_tensor = self.transform(image).unsqueeze(0)  # Add batch dimension
+
         return image_tensor.to(self.device)
 
     def get_embeddings(self, image_array):
@@ -107,7 +108,7 @@ class EmbeddingExtractor:
         Extract embeddings from an image numpy array
 
         Args:
-            image_array: numpy array of shape (H, W, 3) with values 0-255
+            image_array: numpy array of shape (H, W, 1) with values 0-255
 
         Returns:
             numpy.ndarray: Embedding vector of shape (embedding_dim,)

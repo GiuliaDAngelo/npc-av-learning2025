@@ -21,6 +21,9 @@ else "cpu")
 DATA_ROOT = '/media/matt/bigdata/DATA/CRIB/bboxes/'
 RESULTS_DIR = '/media/matt/bigdata/DATA/CRIB/resultsbbox30050epochs/'
 
+# make results dir if it doesn't exist
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
 batch_size = 32
 num_epochs = 1 #50 #we already tried with 8
 num_epochs = 1 #we already tried with 8
