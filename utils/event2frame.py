@@ -65,8 +65,9 @@ def convert_dir(dir, output_dir, res, tw, timesurface=False, display=False):
             # get the name of the object
             # from this format: event_android_100_10_100_40_0.4_0.01.dat
             object_name = filename.split("_")[1]
+            sequence_number = filename.split("_")[2]
             # make folder for object in output_dir
-            object_dir = os.path.join(output_dir, object_name)
+            object_dir = os.path.join(output_dir, object_name, sequence_number)
             os.makedirs(object_dir, exist_ok=True)
             convert_file(os.path.join(dir, filename), object_dir, res, tw, timesurface, display)
 

@@ -433,8 +433,8 @@ def train_model(data_root, results_dir, config=None):
 # Example usage
 if __name__ == "__main__":
     # Update these paths to your actual data locations
-    DATA_ROOT = '/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/bboxes/'
-    RESULTS_DIR = '/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/resultsbbox30050epochs/'
+    DATA_ROOT = '/media/matt/bigdata/DATA/CRIB/bboxes/'
+    RESULTS_DIR = '/media/matt/bigdata/DATA/CRIB/resultsbbox30050epochs/'
 
     # Custom configuration (optional)
     config = {
