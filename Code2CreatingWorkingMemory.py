@@ -21,6 +21,14 @@ from load_model import EmbeddingExtractor
 matplotlib.use('Agg')  # No GUI backend
 
 
+# Configuration paths
+MODEL_PATH = "./autoencoder/patches_conv/best_model.ckpt"
+
+ROOT = '/home/matt/DATA/CRIB/'
+PATH_DATA = ROOT + 'train_event_frames/'
+MEMORY_SAVE_PATH = ROOT + 'workingmemorybbox30050epochs/'
+
+
 class Config:
     """Configuration parameters for the processing pipeline"""
 
@@ -59,7 +67,7 @@ class Config:
 class EventFrameProcessor:
     """Main processor for event frames with attention and memory encoding"""
 
-    def __init__(self, model_path, info_path=None, device=None):
+    def __init__(self, model_path, device=None):
         self.config = Config()
 
         # Setup device
@@ -75,7 +83,7 @@ class EventFrameProcessor:
         print(f"Using device: {self.device}")
 
         # Load model
-        self.model = self._load_model(model_path, info_path)
+        self.model = self._load_model(model_path)
 
         # Initialize networks
         self.net_attention = initialise_attention(self.device, self.config.ATTENTION_PARAMS)
@@ -89,21 +97,17 @@ class EventFrameProcessor:
         # Initialize coordinate encoder
         self.coord_encoder = sspspace.RandomSSPSpace(domain_dim=2, ssp_dim=512)
 
-    def _load_model(self, model_path, info_path):
+    def _load_model(self, model_path):
         """Load the trained autoencoder model"""
         try:
             model = EmbeddingExtractor(
-                model_path=model_path,
-                info_path=info_path
+                model_path=model_path
             )
             print(f"✅ Model loaded successfully: {type(model).__name__}")
             return model
         except Exception as e:
             print(f"❌ Failed to load model: {e}")
             print(f"Model path: {model_path}")
-            if info_path:
-                print(f"Info path: {info_path}")
-            raise
 
     def process_frame(self, img_path, saliency_map, resolution):
         """Process a single event frame and return attention coordinates and features"""
@@ -197,31 +201,35 @@ class EventFrameProcessor:
         elif torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def save_results(self, obj_name, object_memory, image_features, save_path):
-        """Save processing results"""
+    def save_results(self, obj_name, object_memory, image_features, save_path, seq_label=None):
+        """Save processing results. If seq_label is provided, save image_features under save_path/obj_name/seq_label/"""
         os.makedirs(save_path, exist_ok=True)
 
+        # Save object memory (kept at top-level save_path for backward compatibility)
         memory_file = os.path.join(save_path, f'{obj_name}_memory.npy')
-        features_file = os.path.join(save_path, f'{obj_name}_image_features.npy')
-
         np.save(memory_file, object_memory)
+
+        # Save image features into obj_name/seq_label if seq_label provided, otherwise into obj_name
         if image_features is not None:
+            if seq_label:
+                feat_dir = os.path.join(save_path, obj_name, str(seq_label))
+            else:
+                feat_dir = os.path.join(save_path, obj_name)
+            os.makedirs(feat_dir, exist_ok=True)
+
+            # Name the features file using object and sequence for clarity when seq_label given
+            if seq_label:
+                features_file = os.path.join(feat_dir, f'{obj_name}_{seq_label}_image_features.npy')
+            else:
+                features_file = os.path.join(feat_dir, f'{obj_name}_image_features.npy')
+
             np.save(features_file, image_features)
 
-        print(f"  ✅ Saved {obj_name} memory and features")
+        print(f"  ✅ Saved {obj_name} memory and features{f' (seq: {seq_label})' if seq_label else ''}")
 
 
 def main():
     """Main processing pipeline"""
-
-    # Configuration paths
-    MODEL_PATH = "/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/resultsbbox30050epochs/final_model/model.pth"
-    INFO_PATH = "/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/resultsbbox30050epochs/final_model/training_info.json"
-
-    ROOT = '/Users/giuliadangelo/workspace/data/DATASETs/CRIB/CRIB400/train_data/'
-    PATH_DATA = ROOT + 'evframes/'
-    MEMORY_SAVE_PATH = ROOT + 'workingmemorybbox30050epochs/'
-
     # Validate paths
     if not os.path.exists(MODEL_PATH):
         print(f"❌ Model path does not exist: {MODEL_PATH}")
@@ -233,7 +241,7 @@ def main():
 
     # Initialize processor
     try:
-        processor = EventFrameProcessor(MODEL_PATH, INFO_PATH)
+        processor = EventFrameProcessor(MODEL_PATH)
     except Exception as e:
         print(f"❌ Failed to initialize processor: {e}")
         return
@@ -253,16 +261,24 @@ def main():
     # Process each object
     success_count = 0
     for obj in objects:
-        obj_path = os.path.join(PATH_DATA, obj)
+        # get the sequences for the object
+        sequences = natsorted([
+            d for d in os.listdir(os.path.join(PATH_DATA, obj))
+            if os.path.isdir(os.path.join(PATH_DATA, obj, d)) and not d.startswith('.')
+        ])
 
-        try:
-            object_memory, image_features = processor.process_object(obj_path, obj)
-            processor.save_results(obj, object_memory, image_features, MEMORY_SAVE_PATH)
-            success_count += 1
+        for seq_label in sequences:
+            obj_path = os.path.join(PATH_DATA, obj, seq_label)
 
-        except Exception as e:
-            print(f"❌ Failed to process object {obj}: {e}")
-            continue
+            try:
+                object_memory, image_features = processor.process_object(obj_path, obj)
+                processor.save_results(obj, object_memory, image_features, 
+                                       MEMORY_SAVE_PATH, seq_label=seq_label)
+                success_count += 1
+
+            except Exception as e:
+                print(f"❌ Failed to process object {obj}: {e}")
+                continue
 
     print(f"\n✅ Processing complete!")
     print(f"Successfully processed: {success_count}/{len(objects)} objects")

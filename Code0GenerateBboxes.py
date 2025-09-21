@@ -29,7 +29,7 @@ transform = T.Compose([
 # SOURCE_PATH = ROOT + 'train_event_frames/'
 # BBOX_BASE_PATH = ROOT + 'bboxes/'
 
-ROOT = '/media/matt/bigdata/DATA/CRIB/'
+ROOT = '/home/matt/DATA/CRIB/'
 SOURCE_PATH = ROOT + 'train_event_frames/'
 BBOX_BASE_PATH = ROOT + 'bboxes/'
 
@@ -261,17 +261,46 @@ def visualize_roi_extraction_batch(source_path, device, config, visualisationFLA
 
 
 def get_all_files(source_path):
-    """Get all files to process"""
-    objects = natsorted([d for d in os.listdir(source_path)
-                         if os.path.isdir(os.path.join(source_path, d))])
+    """
+    Build a list of (object_name, sequence_id, list_of_image_paths) tuples.
+    Each object can have multiple sequence subfolders. Each sequence tuple
+    contains all image file full paths (not split per image anymore).
+    """
+    objects = natsorted(
+        [d for d in os.listdir(source_path)
+         if os.path.isdir(os.path.join(source_path, d))]
+    )
 
     all_files = []
     for obj in objects:
         obj_path = os.path.join(source_path, obj)
-        data_files = natsorted([f for f in os.listdir(obj_path)
-                                if f.lower().endswith(('.png', '.jpg', '.jpeg')) and f != '.DS_Store'])
-        for data_file in data_files:
-            all_files.append((obj, os.path.join(obj_path, data_file), data_file))
+
+        # Sequence directories under each object
+        sequences = natsorted(
+            [d for d in os.listdir(obj_path)
+             if os.path.isdir(os.path.join(obj_path, d))]
+        )
+
+        for seq in sequences:
+            seq_path = os.path.join(obj_path, seq)
+            data_files = natsorted(
+                [f for f in os.listdir(seq_path)
+                 if f.lower().endswith(('.png', '.jpg', '.jpeg')) and f != '.DS_Store']
+            )
+            if not data_files:
+                continue
+
+            # Try to coerce sequence folder name to int; fallback to original
+            try:
+                sequence_id = int(seq)
+            except ValueError:
+                sequence_id = seq
+
+            # Collect full paths for each file
+            image_paths = [os.path.join(seq_path, f) for f in data_files]
+
+            # Append tuple: (object, sequence_id, list_of_image_paths)
+            all_files.append((obj, sequence_id, image_paths))
 
     return all_files
 
@@ -283,51 +312,71 @@ def main():
 
     config = Config()
 
-    # Get all files
-    all_files = get_all_files(SOURCE_PATH)
-    total_files = len(all_files)
-    print(f"Total files to process: {total_files}")
+    # Get all sequences (per object)
+    all_sequences = get_all_files(SOURCE_PATH)
+    total_sequences = len(all_sequences)
+    print(f"Total sequences to process: {total_sequences}")
 
-    # PROCESS IN BATCHES TO AVOID MEMORY ISSUES
+    total_images_processed = 0
 
-    for batch_start in range(0, total_files, BATCH_SIZE):
-        batch_end = min(batch_start + BATCH_SIZE, total_files)
-        batch_files = all_files[batch_start:batch_end]
-
-        batch_num = batch_start // BATCH_SIZE + 1
-        total_batches = (total_files - 1) // BATCH_SIZE + 1
-
+    # For each object/sequence, process its images in batches
+    for seq_idx, (obj, sequence_id, image_paths) in enumerate(all_sequences):
+        seq_label = str(sequence_id)
         print(f"\n{'=' * 60}")
-        print(f"Processing batch {batch_num}/{total_batches}")
-        print(f"Files {batch_start + 1} to {batch_end} of {total_files}")
+        print(f"Sequence {seq_idx + 1}/{total_sequences}: object='{obj}', sequence='{seq_label}'")
+        print(f"Images in sequence: {len(image_paths)}")
         print(f"{'=' * 60}")
 
-        try:
-            # Process this batch
-            visualize_roi_extraction_batch(
-                SOURCE_PATH, device, config, VISUALIZATION_FLAG,
-                ROI_SIZE, BBOX_BASE_PATH, batch_files
-            )
-
-            # Aggressive cleanup between batches
-            print(f"Completed batch {batch_num}, cleaning memory...")
-            cleanup_memory(device, force_gc=True)
-
-            print(f"✓ Batch {batch_num} completed successfully")
-
-        except Exception as e:
-            print(f"✗ Error in batch {batch_num}: {e}")
-            # More aggressive recovery
-            cleanup_memory(device, force_gc=True)
-            # Add a small delay to let system recover
-            import time
-            time.sleep(1)
-            print(f"Attempting to continue with next batch...")
+        # Process images for this sequence in sub-batches
+        n_images = len(image_paths)
+        if n_images == 0:
             continue
 
+        for batch_start in range(0, n_images, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, n_images)
+            sub_batch_paths = image_paths[batch_start:batch_end]
+
+            # Build batch_files as expected by visualize_roi_extraction_batch:
+            # tuples of (obj_with_sequence_subpath, img_path, filename)
+            # Using os.path.join to form the subfolder under the object folder
+            obj_with_seq = os.path.join(obj, seq_label)
+            batch_files = [
+                (obj_with_seq, img_path, os.path.basename(img_path))
+                for img_path in sub_batch_paths
+            ]
+
+            batch_num = (batch_start // BATCH_SIZE) + 1
+            total_sub_batches = (n_images - 1) // BATCH_SIZE + 1
+
+            print(f"\n-- Processing sub-batch {batch_num}/{total_sub_batches} for {obj}/{seq_label} "
+                  f"({batch_start + 1}-{batch_end} of {n_images}) --")
+
+            try:
+                visualize_roi_extraction_batch(
+                    SOURCE_PATH, device, config, VISUALIZATION_FLAG,
+                    ROI_SIZE, BBOX_BASE_PATH, batch_files
+                )
+
+                # Aggressive cleanup between sub-batches
+                cleanup_memory(device, force_gc=True)
+
+                print(f"✓ Sub-batch {batch_num}/{total_sub_batches} completed")
+
+            except Exception as e:
+                print(f"✗ Error in sub-batch {batch_num} for {obj}/{seq_label}: {e}")
+                cleanup_memory(device, force_gc=True)
+                import time
+                time.sleep(1)
+                print("Attempting to continue with next sub-batch...")
+                continue
+
+            total_images_processed += len(batch_files)
+
+        print(f"Completed sequence '{obj}/{seq_label}'")
+
     print(f"\n{'=' * 60}")
-    print("✓ All batches completed!")
-    print(f"✓ Processed {total_files} files total")
+    print("✓ All sequences completed!")
+    print(f"✓ Processed {total_images_processed} images in {total_sequences} sequences")
     print(f"{'=' * 60}")
 
 
