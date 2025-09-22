@@ -45,8 +45,15 @@ class ConvAutoencoder(nn.Module):
         # Encoder only
         x = self.pool(F.relu(self.conv1(x)))  # img_size -> img_size//2
         encoded = self.pool(F.relu(self.conv2(x)))  # img_size//2 -> img_size//4
+        encoded = encoded.view(encoded.size(0), -1)
+        # Normalize the encoded representation
+        #print('ENCODED SHAPE', encoded.shape)
+        encoded = encoded / (torch.norm(encoded, dim=1, keepdim=True) + 1e-8)
+        # set nans to zero
+        # TODO: retrain the autoencoder with normalized embeddings
+        #encoded[torch.isnan(encoded)] = 0
         # Flatten the encoded representation
-        return encoded.view(encoded.size(0), -1)
+        return encoded
 
 
 class EmbeddingExtractor:

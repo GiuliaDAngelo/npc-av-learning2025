@@ -11,7 +11,6 @@ from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 from sklearn.metrics.pairwise import cosine_similarity
 import seaborn as sns
-from collections import defaultdict
 from natsort import natsorted
 
 class WorkingMemoryAnalyzer:
@@ -102,18 +101,6 @@ class WorkingMemoryAnalyzer:
         
         return len(self.object_names) > 0
     
-    def prepare_memory_for_processing(self, memory):
-        """Helper function to prepare a single memory for processing"""
-        # Handle complex SSP vectors - take real part if complex
-        if np.iscomplexobj(memory):
-            memory = np.real(memory)
-        
-        # Flatten if multi-dimensional
-        if memory.ndim > 1:
-            memory = memory.flatten()
-            
-        return memory
-    
     def visualize_with_tsne_combined(self, perplexity=5, random_state=42):
         """Create t-SNE visualization showing both individual and combined memories"""
         if not self.individual_memories and not self.combined_memories:
@@ -136,8 +123,7 @@ class WorkingMemoryAnalyzer:
         for obj_name in self.object_names:
             if obj_name in self.individual_memories:
                 for seq_label, memory in self.individual_memories[obj_name].items():
-                    processed_memory = self.prepare_memory_for_processing(memory)
-                    memory_data.append(processed_memory)
+                    memory_data.append(memory)
                     labels.append(f"{obj_name}_{seq_label}")
                     point_types.append('individual')
                     colors_list.append(color_map[obj_name])
@@ -146,8 +132,7 @@ class WorkingMemoryAnalyzer:
         for obj_name in self.object_names:
             if obj_name in self.combined_memories:
                 memory = self.combined_memories[obj_name]
-                processed_memory = self.prepare_memory_for_processing(memory)
-                memory_data.append(processed_memory)
+                memory_data.append(memory)
                 labels.append(f"{obj_name}_avg")
                 point_types.append('combined')
                 colors_list.append(color_map[obj_name])
@@ -163,16 +148,10 @@ class WorkingMemoryAnalyzer:
         n_samples = len(labels)
         perplexity = min(perplexity, max(1, n_samples - 1))
         
-        # # Apply PCA first if needed
-        # if memory_matrix.shape[1] > 50:
-        #     print("Applying PCA preprocessing...")
-        #     pca = PCA(n_components=50, random_state=random_state)
-        #     memory_matrix = pca.fit_transform(memory_matrix)
-        
         # Apply t-SNE
         print("Running t-SNE...")
         tsne = TSNE(n_components=2, perplexity=perplexity, random_state=random_state, 
-                   n_iter=1000, verbose=0)
+                   max_iter=1000, verbose=0)
         embeddings_2d = tsne.fit_transform(memory_matrix)
         
         # Create visualization
@@ -228,8 +207,7 @@ class WorkingMemoryAnalyzer:
         
         for obj_name in obj_names:
             memory = self.combined_memories[obj_name]
-            processed_memory = self.prepare_memory_for_processing(memory)
-            memory_data.append(processed_memory)
+            memory_data.append(memory)
         
         if len(memory_data) < 2:
             print("❌ Need at least 2 objects for similarity matrix")
@@ -287,14 +265,12 @@ class WorkingMemoryAnalyzer:
         for obj_name in natsorted(common_objects):
             # Add combined memory
             combined_memory = self.combined_memories[obj_name]
-            processed_combined = self.prepare_memory_for_processing(combined_memory)
-            combined_data.append(processed_combined)
+            combined_data.append(combined_memory)
             combined_labels.append(f"{obj_name}_avg")
             
             # Add individual memories
             for seq_label, memory in self.individual_memories[obj_name].items():
-                processed_memory = self.prepare_memory_for_processing(memory)
-                individual_data.append(processed_memory)
+                individual_data.append(memory)
                 individual_labels.append(f"{obj_name}_{seq_label}")
         
         if not individual_data or not combined_data:
@@ -345,16 +321,9 @@ class WorkingMemoryAnalyzer:
         perplexity = min(perplexity, max(1, n_samples - 1))
         
         try:
-            # Apply PCA first to reduce dimensionality if needed
-            # if memory_matrix.shape[1] > 50:
-            #     print("Applying PCA preprocessing...")
-            #     pca = PCA(n_components=50, random_state=random_state)
-            #     memory_matrix = pca.fit_transform(memory_matrix)
-            #     print(f"PCA reduced to {memory_matrix.shape[1]} dimensions")
-            
             # Apply t-SNE
             tsne = TSNE(n_components=2, perplexity=perplexity, random_state=random_state, 
-                       n_iter=1000, verbose=1)
+                       max_iter=1000, verbose=1)
             embeddings_2d = tsne.fit_transform(memory_matrix)
             
             # Create visualization
@@ -464,89 +433,6 @@ class WorkingMemoryAnalyzer:
         print(f"\n✅ Analysis saved to 'working_memory_analysis.json'")
         
         return memory_stats
-    
-    def compare_with_image_features(self):
-        """Compare working memories with direct image features if available"""
-        if not self.features:
-            print("No image features available for comparison")
-            return
-            
-        print("\n" + "="*60)
-        print("WORKING MEMORY vs IMAGE FEATURES COMPARISON")
-        print("="*60)
-        
-        # Prepare data for both types
-        memory_data = []
-        feature_data = []
-        common_objects = []
-        
-        for obj_name in self.object_names:
-            if obj_name in self.memories and obj_name in self.features:
-                memory = self.memories[obj_name]
-                features = self.features[obj_name]
-                
-                # Process memory
-                if np.iscomplexobj(memory):
-                    memory = np.real(memory)
-                if memory.ndim > 1:
-                    memory = memory.flatten()
-                
-                # Process features
-                if features.ndim > 1:
-                    features = features.flatten()
-                
-                memory_data.append(memory)
-                feature_data.append(features)
-                common_objects.append(obj_name)
-        
-        if len(common_objects) < 2:
-            print("Not enough objects with both memory and features for comparison")
-            return
-        
-        # Create comparison visualization
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-        
-        # t-SNE for working memories
-        if len(memory_data) > 1:
-            memory_matrix = np.vstack(memory_data)
-            if memory_matrix.shape[1] > 50:
-                pca_mem = PCA(n_components=50)
-                memory_matrix = pca_mem.fit_transform(memory_matrix)
-            
-            tsne_mem = TSNE(n_components=2, perplexity=min(3, len(common_objects)-1))
-            mem_2d = tsne_mem.fit_transform(memory_matrix)
-            
-            colors = plt.cm.tab10(np.linspace(0, 1, len(common_objects)))
-            for i, (obj, color) in enumerate(zip(common_objects, colors)):
-                ax1.scatter(mem_2d[i, 0], mem_2d[i, 1], c=[color], s=100, alpha=0.7)
-                ax1.annotate(obj, (mem_2d[i, 0], mem_2d[i, 1]), 
-                           xytext=(5, 5), textcoords='offset points', fontsize=9)
-            
-            ax1.set_title('Working Memory t-SNE')
-            ax1.grid(True, alpha=0.3)
-        
-        # t-SNE for image features
-        if len(feature_data) > 1:
-            feature_matrix = np.vstack(feature_data)
-            if feature_matrix.shape[1] > 50:
-                pca_feat = PCA(n_components=50)
-                feature_matrix = pca_feat.fit_transform(feature_matrix)
-            
-            tsne_feat = TSNE(n_components=2, perplexity=min(3, len(common_objects)-1))
-            feat_2d = tsne_feat.fit_transform(feature_matrix)
-            
-            for i, (obj, color) in enumerate(zip(common_objects, colors)):
-                ax2.scatter(feat_2d[i, 0], feat_2d[i, 1], c=[color], s=100, alpha=0.7)
-                ax2.annotate(obj, (feat_2d[i, 0], feat_2d[i, 1]), 
-                           xytext=(5, 5), textcoords='offset points', fontsize=9)
-            
-            ax2.set_title('Image Features t-SNE')
-            ax2.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig('memory_vs_features_comparison.png', dpi=150, bbox_inches='tight')
-        print("✅ Comparison visualization saved to 'memory_vs_features_comparison.png'")
-        #plt.show()
 
 
 def main():

@@ -8,7 +8,6 @@ import torchvision.transforms as T
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import matplotlib
-import cv2
 import gc
 
 # Set MPS memory management - Remove high watermark to avoid ratio errors

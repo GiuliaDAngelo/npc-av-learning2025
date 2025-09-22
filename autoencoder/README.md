@@ -12,3 +12,4 @@
 ```python extract_patches.py --M 10 --N 100 --test_split 0.2 --crop 80```
 
 ## 4. Train the Autoencoder
+```python3 conv.py```
