@@ -95,7 +95,7 @@ class EventFrameProcessor:
         ])
 
         # Initialize coordinate encoder
-        self.coord_encoder = sspspace.RandomSSPSpace(domain_dim=2, ssp_dim=512)
+        self.coord_encoder = sspspace.RandomSSPSpace(domain_dim=2, ssp_dim=2500)
 
     def _load_model(self, model_path):
         """Load the trained autoencoder model"""
@@ -111,44 +111,40 @@ class EventFrameProcessor:
 
     def process_frame(self, img_path, saliency_map, resolution):
         """Process a single event frame and return attention coordinates and features"""
-        try:
-            # Load and preprocess image
-            img = Image.open(img_path)
-            window = self.transform(img)
+        # Load and preprocess image
+        img = Image.open(img_path)
+        window = self.transform(img)
 
-            # Run attention mechanism
-            saliency_map[:], salmax_coords = run_attention(
-                window, self.net_attention, self.device,
-                resolution, self.config.ATTENTION_PARAMS['num_pyr']
-            )
+        # Run attention mechanism
+        saliency_map[:], salmax_coords = run_attention(
+            window, self.net_attention, self.device,
+            resolution, self.config.ATTENTION_PARAMS['num_pyr']
+        )
 
-            # Convert to displayable format
-            window_img = window.detach().cpu().numpy().squeeze(0)
-            window_img = (window_img * 255).clip(0, 255).astype(np.uint8)
+        # Convert to displayable format
+        window_img = window.detach().cpu().numpy().squeeze(0)
+        window_img = (window_img * 255).clip(0, 255).astype(np.uint8)
 
-            # Extract ROI coordinates
-            x, y = salmax_coords[1], salmax_coords[0]
-            x1 = max(x - self.config.BOX_SIZE // 2, 0)
-            y1 = max(y - self.config.BOX_SIZE // 2, 0)
-            x2 = min(x + self.config.BOX_SIZE // 2, window_img.shape[1])
-            y2 = min(y + self.config.BOX_SIZE // 2, window_img.shape[0])
+        # Extract ROI coordinates
+        x, y = salmax_coords[1], salmax_coords[0]
+        x1 = max(x - self.config.BOX_SIZE // 2, 0)
+        y1 = max(y - self.config.BOX_SIZE // 2, 0)
+        x2 = min(x + self.config.BOX_SIZE // 2, window_img.shape[1])
+        y2 = min(y + self.config.BOX_SIZE // 2, window_img.shape[0])
 
-            # Extract ROI and get features
-            roi_crop = window_img[y1:y2, x1:x2]
+        # Extract ROI and get features
+        roi_crop = window_img[y1:y2, x1:x2]
 
-            with torch.no_grad():
-                image_features = self.model.get_embeddings(roi_crop)
+        with torch.no_grad():
+            image_features = self.model.get_embeddings(roi_crop)
 
-            # Create spatial encoding
-            roi_center = self.coord_encoder.encode([[x, y]])
-            img_feat_ssp = sspspace.SSP(image_features)
-            new_roi = roi_center * img_feat_ssp
+        # Create spatial encoding
+        roi_center = self.coord_encoder.encode([[x, y]])
+        img_feat_ssp = sspspace.SSP(image_features)
+        new_roi = roi_center * img_feat_ssp
 
-            return new_roi, image_features, (x, y)
+        return new_roi, image_features, (x, y)
 
-        except Exception as e:
-            print(f"    Error processing frame {os.path.basename(img_path)}: {e}")
-            return None, None, None
 
     def process_object(self, obj_path, obj_name):
         """Process all frames for a single object"""
@@ -270,15 +266,10 @@ def main():
         for seq_label in sequences:
             obj_path = os.path.join(PATH_DATA, obj, seq_label)
 
-            try:
-                object_memory, image_features = processor.process_object(obj_path, obj)
-                processor.save_results(obj, object_memory, image_features, 
-                                       MEMORY_SAVE_PATH, seq_label=seq_label)
-                success_count += 1
-
-            except Exception as e:
-                print(f"❌ Failed to process object {obj}: {e}")
-                continue
+            object_memory, image_features = processor.process_object(obj_path, obj)
+            processor.save_results(obj, object_memory, image_features, 
+                                    MEMORY_SAVE_PATH, seq_label=seq_label)
+            success_count += 1
 
     print(f"\n✅ Processing complete!")
     print(f"Successfully processed: {success_count}/{len(objects)} objects")

@@ -129,6 +129,9 @@ def visualize_roi_extraction_batch(source_path, device, config, visualisationFLA
 
     # Keep track of processed objects to create directories on-demand
     processed_objects = set()
+    
+    # Store coordinates for this batch (will be returned)
+    batch_coordinates = []
 
     # Process batch files
     for idx, (obj, img_path, data_file) in enumerate(batch_files):
@@ -162,6 +165,9 @@ def visualize_roi_extraction_batch(source_path, device, config, visualisationFLA
 
             # Extract coordinates
             y, x = salmax_coords[0], salmax_coords[1]
+            
+            # Store coordinates for this frame
+            batch_coordinates.append([x, y])
 
             # Calculate bounding box with fixed size
             x1 = max(x - (box_size // 2), 0)
@@ -258,6 +264,8 @@ def visualize_roi_extraction_batch(source_path, device, config, visualisationFLA
 
     if visualisationFLAG:
         plt.close(fig)
+    
+    return batch_coordinates
 
 
 def get_all_files(source_path):
@@ -331,6 +339,9 @@ def main():
         n_images = len(image_paths)
         if n_images == 0:
             continue
+        
+        # Collect all coordinates for this sequence
+        sequence_coordinates = []
 
         for batch_start in range(0, n_images, BATCH_SIZE):
             batch_end = min(batch_start + BATCH_SIZE, n_images)
@@ -352,10 +363,13 @@ def main():
                   f"({batch_start + 1}-{batch_end} of {n_images}) --")
 
             try:
-                visualize_roi_extraction_batch(
+                batch_coords = visualize_roi_extraction_batch(
                     SOURCE_PATH, device, config, VISUALIZATION_FLAG,
                     ROI_SIZE, BBOX_BASE_PATH, batch_files
                 )
+                
+                # Add batch coordinates to sequence coordinates
+                sequence_coordinates.extend(batch_coords)
 
                 # Aggressive cleanup between sub-batches
                 cleanup_memory(device, force_gc=True)
@@ -371,6 +385,23 @@ def main():
                 continue
 
             total_images_processed += len(batch_files)
+        
+        # Save coordinates for this sequence
+        if sequence_coordinates:
+            try:
+                # Create directory structure matching bbox output
+                coords_save_dir = os.path.join(BBOX_BASE_PATH, obj, seq_label)
+                os.makedirs(coords_save_dir, exist_ok=True)
+                
+                # Save coordinates as numpy array
+                coords_array = np.array(sequence_coordinates)
+                coords_file = os.path.join(coords_save_dir, f"{obj}_{seq_label}_coordinates.npy")
+                np.save(coords_file, coords_array)
+                
+                print(f"✓ Saved {len(sequence_coordinates)} coordinates to {coords_file}")
+                
+            except Exception as e:
+                print(f"✗ Error saving coordinates for {obj}/{seq_label}: {e}")
 
         print(f"Completed sequence '{obj}/{seq_label}'")
 
