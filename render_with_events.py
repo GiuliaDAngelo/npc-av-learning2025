@@ -14,6 +14,7 @@ import argparse
 import torch
 import torchvision.transforms as T
 from PIL import Image
+import sspspace
 
 # Add IEBCS to path
 sys.path.append("IEBCS/src")
@@ -63,43 +64,120 @@ ATTENTION_PARAMS = {
     'out_ch': 1
 }
 ROI_SIZE = 100  # Size of saccade bounding box
+GAMMA = 0.99  # Memory update factor (from Code1CreateWorkingMemory)
 
 
-def process_saccade_vsa(image_patch, saccade_center, rotation_state, dino_model, dino_transform, dino_device):
+class WorkingMemory:
     """
-    VSA processing stub for saccade-based learning.
-
-    Args:
-        image_patch: numpy array of the image patch around saccade (ROI_SIZE x ROI_SIZE x 3)
-        saccade_center: tuple of (x, y) coordinates of saccade center
-        rotation_state: dict containing rotation information {'yaw': float, 'pitch': float, 'quaternion': tuple}
-        dino_model: DINO model for extracting embeddings
-        dino_transform: Transform for preprocessing image for DINO
-        dino_device: torch device for DINO
+    VSA-based working memory for saccade-based object learning.
+    Binds DINO embeddings with coordinates and quaternions, bundles over time.
     """
-    # Convert BGR to RGB for DINO
-    image_patch_rgb = cv2.cvtColor(image_patch, cv2.COLOR_BGR2RGB)
 
-    # Convert to PIL Image
-    pil_image = Image.fromarray(image_patch_rgb)
+    def __init__(self, dino_model, dino_transform, dino_device, ssp_dim=2500):
+        """
+        Initialize working memory with DINO model and SSP encoders.
 
-    # Preprocess for DINO
-    input_tensor = dino_transform(pil_image).unsqueeze(0).to(dino_device)
+        Args:
+            dino_model: DINO model for image embeddings
+            dino_transform: Transform for DINO preprocessing
+            dino_device: Device for DINO inference
+            ssp_dim: Dimension of spatial semantic pointers
+        """
+        self.dino_model = dino_model
+        self.dino_transform = dino_transform
+        self.dino_device = dino_device
+        self.ssp_dim = ssp_dim
 
-    # Extract DINO embeddings
-    with torch.no_grad():
-        embeddings = dino_model(input_tensor)
+        # Initialize SSP encoders
+        # Coordinate encoder (2D: x, y in pixel space)
+        self.coord_encoder = sspspace.RandomSSPSpace(domain_dim=2, ssp_dim=ssp_dim)
 
-    print(f"\n=== VSA Saccade Processing ===")
-    print(f"Saccade center: ({saccade_center[0]}, {saccade_center[1]})")
-    print(f"Image patch shape: {image_patch.shape}")
-    print(f"DINO embedding shape: {embeddings.shape}, {embeddings.min():.3f} to {embeddings.max():.3f}")
-    print(f"Rotation - Yaw: {rotation_state['yaw']:.3f} rad, Pitch: {rotation_state['pitch']:.3f} rad")
-    print(f"Quaternion: [{rotation_state['quaternion'][0]:.3f}, {rotation_state['quaternion'][1]:.3f}, "
-          f"{rotation_state['quaternion'][2]:.3f}, {rotation_state['quaternion'][3]:.3f}]")
-    print("=" * 40)
+        # Quaternion encoder (4D: qw, qx, qy, qz)
+        self.quat_encoder = sspspace.RandomSSPSpace(domain_dim=4, ssp_dim=ssp_dim)
 
-    return embeddings
+        # Initialize working memory (will be updated over time)
+        self.memory = self.coord_encoder.encode([[0, 0]])
+        self.saccade_count = 0
+
+        print(f"  Working Memory initialized (SSP dim: {ssp_dim})")
+
+    def bind(self, a, b):
+        """VSA binding using circular convolution (FFT)"""
+        a = np.atleast_2d(a)
+        b = np.atleast_2d(b)
+        return np.fft.ifft(np.fft.fft(a, axis=1) * np.fft.fft(b, axis=1), axis=1).real
+
+    def process_saccade(self, image_patch, saccade_center, rotation_state):
+        """
+        Process a saccade by binding image, coordinate, and rotation, then bundling into memory.
+
+        Args:
+            image_patch: numpy array of the image patch around saccade (ROI_SIZE x ROI_SIZE x 3)
+            saccade_center: tuple of (x, y) coordinates of saccade center
+            rotation_state: dict containing rotation information
+        """
+        # Extract DINO embeddings from image patch
+        image_patch_rgb = cv2.cvtColor(image_patch, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(image_patch_rgb)
+        input_tensor = self.dino_transform(pil_image).unsqueeze(0).to(self.dino_device)
+
+        with torch.no_grad():
+            dino_embedding = self.dino_model(input_tensor)
+
+        # Convert to numpy and ensure proper shape
+        dino_embedding = dino_embedding.cpu().numpy()
+        if dino_embedding.shape[1] != self.ssp_dim:
+            # Pad or project DINO embedding to match SSP dimension
+            if dino_embedding.shape[1] < self.ssp_dim:
+                # Pad with zeros
+                padding = np.zeros((1, self.ssp_dim - dino_embedding.shape[1]))
+                dino_embedding = np.hstack([dino_embedding, padding])
+            else:
+                # Truncate (could also use a learned projection)
+                dino_embedding = dino_embedding[:, :self.ssp_dim]
+
+        # Encode coordinate as SSP
+        x, y = saccade_center
+        coord_ssp = self.coord_encoder.encode([[x, y]])
+        coord_ssp = np.array(coord_ssp).squeeze()
+
+        # Encode quaternion as SSP
+        quat = rotation_state['quaternion']
+        quat_ssp = self.quat_encoder.encode([[quat[0], quat[1], quat[2], quat[3]]])
+        quat_ssp = np.array(quat_ssp).squeeze()
+
+        # Bind image with coordinate
+        bound_img_coord = self.bind(dino_embedding, coord_ssp)
+
+        # Bind with quaternion
+        bound_representation = self.bind(bound_img_coord, quat_ssp)
+
+        # Bundle into working memory with exponential decay
+        self.memory = GAMMA * self.memory + (1 - GAMMA) * bound_representation
+        self.saccade_count += 1
+
+        # Print debug info
+        print(f"\n=== VSA Saccade Processing ===")
+        print(f"Saccade #{self.saccade_count}")
+        print(f"Saccade center: ({x}, {y})")
+        print(f"Image patch shape: {image_patch.shape}")
+        print(f"DINO embedding shape: {dino_embedding.shape}, range: [{dino_embedding.min():.3f}, {dino_embedding.max():.3f}]")
+        print(f"Rotation - Yaw: {rotation_state['yaw']:.3f} rad, Pitch: {rotation_state['pitch']:.3f} rad")
+        print(f"Quaternion: [{quat[0]:.3f}, {quat[1]:.3f}, {quat[2]:.3f}, {quat[3]:.3f}]")
+        print(f"Memory shape: {self.memory.shape}, mean: {self.memory.mean():.5f}, std: {self.memory.std():.5f}")
+        print("=" * 40)
+
+        return self.memory
+
+    def get_memory(self):
+        """Return current working memory representation"""
+        return self.memory
+
+    def reset_memory(self):
+        """Reset working memory to initial state"""
+        self.memory = self.coord_encoder.encode([[0, 0]])
+        self.saccade_count = 0
+        print("  Working memory reset")
 
 
 class EventFrameRenderer:
@@ -201,9 +279,7 @@ def render_rotating_object_with_events(xml_path, obj_name, enable_saccades=False
 
         # Initialize attention network and DINO if saccades enabled
         net_attention = None
-        dino_model = None
-        dino_transform = None
-        dino_device = None
+        working_memory = None
         device = None
         transform = None
         if enable_saccades:
@@ -232,6 +308,10 @@ def render_rotating_object_with_events(xml_path, obj_name, enable_saccades=False
                 T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ])
             print(f"    DINO model loaded")
+
+            # Initialize working memory
+            working_memory = WorkingMemory(dino_model, dino_transform, dino_device)
+            print(f"    Working memory initialized")
 
         # Create display window
         window_name = f"Real-time Events: {obj_name}"
@@ -349,9 +429,8 @@ def render_rotating_object_with_events(xml_path, obj_name, enable_saccades=False
                     'quaternion': (data.qpos[3], data.qpos[4], data.qpos[5], data.qpos[6])
                 }
 
-                # Process with VSA (stub function)
-                process_saccade_vsa(image_patch, (saccade_x, saccade_y), rotation_state,
-                                   dino_model, dino_transform, dino_device)
+                # Process with VSA working memory
+                working_memory.process_saccade(image_patch, (saccade_x, saccade_y), rotation_state)
 
                 # Draw on EVENT frame
                 # Draw crosshair at saccade location
