@@ -13,6 +13,7 @@ import sys
 import argparse
 import torch
 import torchvision.transforms as T
+from PIL import Image
 
 # Add IEBCS to path
 sys.path.append("IEBCS/src")
@@ -64,7 +65,7 @@ ATTENTION_PARAMS = {
 ROI_SIZE = 100  # Size of saccade bounding box
 
 
-def process_saccade_vsa(image_patch, saccade_center, rotation_state):
+def process_saccade_vsa(image_patch, saccade_center, rotation_state, dino_model, dino_transform, dino_device):
     """
     VSA processing stub for saccade-based learning.
 
@@ -72,14 +73,33 @@ def process_saccade_vsa(image_patch, saccade_center, rotation_state):
         image_patch: numpy array of the image patch around saccade (ROI_SIZE x ROI_SIZE x 3)
         saccade_center: tuple of (x, y) coordinates of saccade center
         rotation_state: dict containing rotation information {'yaw': float, 'pitch': float, 'quaternion': tuple}
+        dino_model: DINO model for extracting embeddings
+        dino_transform: Transform for preprocessing image for DINO
+        dino_device: torch device for DINO
     """
+    # Convert BGR to RGB for DINO
+    image_patch_rgb = cv2.cvtColor(image_patch, cv2.COLOR_BGR2RGB)
+
+    # Convert to PIL Image
+    pil_image = Image.fromarray(image_patch_rgb)
+
+    # Preprocess for DINO
+    input_tensor = dino_transform(pil_image).unsqueeze(0).to(dino_device)
+
+    # Extract DINO embeddings
+    with torch.no_grad():
+        embeddings = dino_model(input_tensor)
+
     print(f"\n=== VSA Saccade Processing ===")
     print(f"Saccade center: ({saccade_center[0]}, {saccade_center[1]})")
     print(f"Image patch shape: {image_patch.shape}")
+    print(f"DINO embedding shape: {embeddings.shape}, {embeddings.min():.3f} to {embeddings.max():.3f}")
     print(f"Rotation - Yaw: {rotation_state['yaw']:.3f} rad, Pitch: {rotation_state['pitch']:.3f} rad")
     print(f"Quaternion: [{rotation_state['quaternion'][0]:.3f}, {rotation_state['quaternion'][1]:.3f}, "
           f"{rotation_state['quaternion'][2]:.3f}, {rotation_state['quaternion'][3]:.3f}]")
     print("=" * 40)
+
+    return embeddings
 
 
 class EventFrameRenderer:
@@ -179,19 +199,39 @@ def render_rotating_object_with_events(xml_path, obj_name, enable_saccades=False
         # Initialize event frame renderer
         event_renderer = EventFrameRenderer(WIDTH, HEIGHT, tau=3*DT)
 
-        # Initialize attention network if saccades enabled
+        # Initialize attention network and DINO if saccades enabled
         net_attention = None
+        dino_model = None
+        dino_transform = None
+        dino_device = None
         device = None
         transform = None
         if enable_saccades:
             print(f"  Initializing attention network for saccades...")
             device = torch.device("mps" if torch.backends.mps.is_available()
                                 else "cuda" if torch.cuda.is_available() else "cpu")
-            print(f"    Using device: {device}")
+            print(f"    Using device for attention: {device}")
             net_attention = initialise_attention(device, ATTENTION_PARAMS)
             transform = T.Compose([
                 T.ToTensor(),
             ])
+
+            # Initialize DINO model on CPU (MPS doesn't support bicubic interpolation)
+            print(f"  Initializing DINO model...")
+            dino_device = torch.device("cpu")
+            print(f"    Using device for DINO: {dino_device} (MPS doesn't support bicubic interpolation)")
+            dino_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+            dino_model = dino_model.to(dino_device)
+            dino_model.eval()
+
+            # DINO preprocessing transform
+            dino_transform = T.Compose([
+                T.Resize(224, interpolation=T.InterpolationMode.BICUBIC),
+                T.CenterCrop(224),
+                T.ToTensor(),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+            print(f"    DINO model loaded")
 
         # Create display window
         window_name = f"Real-time Events: {obj_name}"
@@ -310,7 +350,8 @@ def render_rotating_object_with_events(xml_path, obj_name, enable_saccades=False
                 }
 
                 # Process with VSA (stub function)
-                process_saccade_vsa(image_patch, (saccade_x, saccade_y), rotation_state)
+                process_saccade_vsa(image_patch, (saccade_x, saccade_y), rotation_state,
+                                   dino_model, dino_transform, dino_device)
 
                 # Draw on EVENT frame
                 # Draw crosshair at saccade location
