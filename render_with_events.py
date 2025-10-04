@@ -64,6 +64,24 @@ ATTENTION_PARAMS = {
 ROI_SIZE = 100  # Size of saccade bounding box
 
 
+def process_saccade_vsa(image_patch, saccade_center, rotation_state):
+    """
+    VSA processing stub for saccade-based learning.
+
+    Args:
+        image_patch: numpy array of the image patch around saccade (ROI_SIZE x ROI_SIZE x 3)
+        saccade_center: tuple of (x, y) coordinates of saccade center
+        rotation_state: dict containing rotation information {'yaw': float, 'pitch': float, 'quaternion': tuple}
+    """
+    print(f"\n=== VSA Saccade Processing ===")
+    print(f"Saccade center: ({saccade_center[0]}, {saccade_center[1]})")
+    print(f"Image patch shape: {image_patch.shape}")
+    print(f"Rotation - Yaw: {rotation_state['yaw']:.3f} rad, Pitch: {rotation_state['pitch']:.3f} rad")
+    print(f"Quaternion: [{rotation_state['quaternion'][0]:.3f}, {rotation_state['quaternion'][1]:.3f}, "
+          f"{rotation_state['quaternion'][2]:.3f}, {rotation_state['quaternion'][3]:.3f}]")
+    print("=" * 40)
+
+
 class EventFrameRenderer:
     """Renders time surface from events"""
 
@@ -280,6 +298,19 @@ def render_rotating_object_with_events(xml_path, obj_name, enable_saccades=False
                     x1 = max(x2 - ROI_SIZE, 0)
                 if y2 - y1 < ROI_SIZE and y1 > 0:
                     y1 = max(y2 - ROI_SIZE, 0)
+
+                # Extract image patch from event frame
+                image_patch = event_frame[y1:y2, x1:x2]
+
+                # Prepare rotation state
+                rotation_state = {
+                    'yaw': yaw_angle,
+                    'pitch': pitch_angle,
+                    'quaternion': (data.qpos[3], data.qpos[4], data.qpos[5], data.qpos[6])
+                }
+
+                # Process with VSA (stub function)
+                process_saccade_vsa(image_patch, (saccade_x, saccade_y), rotation_state)
 
                 # Draw on EVENT frame
                 # Draw crosshair at saccade location
