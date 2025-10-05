@@ -21,6 +21,8 @@ import sspspace
 import random
 from collections import deque
 import math
+import json
+from datetime import datetime
 
 # Add IEBCS to path
 sys.path.append("IEBCS/src")
@@ -68,11 +70,11 @@ K_SALIENCY = 5              # Agent can choose from top K salient points
 NUM_MOVE_ACTIONS = 5        # inc/dec yaw, inc/dec pitch, do_nothing
 NUM_SACCADE_ACTIONS = K_SALIENCY
 TOTAL_ACTIONS = NUM_MOVE_ACTIONS + NUM_SACCADE_ACTIONS
-SSP_DIM = 2500              # Must match WorkingMemory ssp_dim
+SSP_DIM = 1000              # Must match WorkingMemory ssp_dim
 
 # RL Hyperparameters
-REPLAY_BUFFER_SIZE = 10000
-BATCH_SIZE = 32
+REPLAY_BUFFER_SIZE = 5000
+BATCH_SIZE = 8
 GAMMA_RL = 0.99             # RL discount factor
 EPSILON_START = 0.9
 EPSILON_END = 0.05
@@ -187,6 +189,31 @@ class DiscriminationAgent:
         """Copies weights from the policy network to the target network."""
         self.target_net.load_state_dict(self.policy_net.state_dict())
 
+    def save(self, path):
+        """Saves the agent's policy network weights."""
+        torch.save({
+            'policy_net_state_dict': self.policy_net.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'steps_done': self.steps_done
+        }, path)
+        print(f"  Agent saved to {path}")
+
+    def load(self, path):
+        """Loads the agent's policy network weights."""
+        checkpoint = torch.load(path, map_location=self.device)
+        self.policy_net.load_state_dict(checkpoint['policy_net_state_dict'])
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.steps_done = checkpoint['steps_done']
+        print(f"  Agent loaded from {path}")
+
+    def choose_action_greedy(self, state):
+        """Chooses the best action without exploration (for inference)."""
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            q_values = self.policy_net(state_tensor)
+            return torch.argmax(q_values).item()
+
 
 class WorkingMemory:
     """VSA-based working memory for saccade-based object learning."""
@@ -265,6 +292,8 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
     - 'display': Just shows the rotating object (original behavior).
     - 'reference': Builds and returns a memory of a reference object.
     - 'train': Runs the RL loop to train the agent.
+    - 'inference': Uses learned policy to explore and returns memory.
+    - 'demo': Interactive mode with manual rotation control via arrow keys.
     """
     model = mujoco.MjModel.from_xml_path(xml_path)
     data = mujoco.MjData(model)
@@ -303,10 +332,13 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
     cv2.resizeWindow(window_name, WIDTH * 2, HEIGHT)
 
     yaw_angle, pitch_angle = 0.0, 0.0
-    yaw_speed, pitch_speed = (INITIAL_YAW_SPEED, 0.0) if mode != 'train' else (0.0, 0.0)
-    
-    max_steps = 200 if mode == 'reference' else 2000 # Shorter for ref, longer for training
-    
+    yaw_speed, pitch_speed = (INITIAL_YAW_SPEED, 0.0) if mode not in ['train', 'inference'] else (0.0, 0.0)
+
+    # TODO: use more ref steps (e.g. 2000) if it works and we can run it on a GPU
+    max_steps = 200 if mode in ['reference', 'inference'] else 200 # Shorter for ref, longer for training
+    if mode == 'demo':
+        max_steps = 100000  # Run indefinitely until user quits
+
     for step in range(max_steps):
         # --- RL: State, Action, Reward, Next State ---
         current_state = None
@@ -344,7 +376,7 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
                 salmax_coords = top_k_coords[0] # Default to top-1
 
         # --- RL: Main Logic ---
-        if mode == 'train' and agent is not None:
+        if mode in ['train', 'inference'] and agent is not None:
             # 3. CONSTRUCT STATE
             current_mem = working_memory.get_memory()
             if top_k_coords:
@@ -353,12 +385,17 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
                 coords_flat[::2] = (coords_flat[::2] / HEIGHT) * 2 - 1 # Y
                 coords_flat[1::2] = (coords_flat[1::2] / WIDTH) * 2 - 1 # X
                 top_k_coords_normalized[:len(coords_flat)] = coords_flat
-            
+
             current_state = np.concatenate([current_mem, top_k_coords_normalized])
-            sim_before = F.cosine_similarity(torch.Tensor(reference_memory), torch.Tensor(current_mem), dim=0).item()
+            if mode == 'train':
+                sim_before = F.cosine_similarity(torch.Tensor(reference_memory), torch.Tensor(current_mem), dim=0).item()
 
             # 4. CHOOSE AND EXECUTE ACTION
-            action_idx = agent.choose_action(current_state)
+            if mode == 'train':
+                action_idx = agent.choose_action(current_state)
+            else:  # inference mode - use greedy policy
+                action_idx = agent.choose_action_greedy(current_state)
+
             if action_idx < NUM_MOVE_ACTIONS:
                 # It's a move action
                 if action_idx == 0: yaw_speed += SPEED_INCREMENT
@@ -415,22 +452,73 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
              cv2.rectangle(display_original, (roi_coords[0], roi_coords[1]), (roi_coords[2], roi_coords[3]), (0, 255, 0), 2)
         combined = np.hstack([display_original, event_frame_display])
         cv2.putText(combined, f"Mode: {mode}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        if mode == 'demo':
+            cv2.putText(combined, f"Yaw: {yaw_speed:.3f} | Pitch: {pitch_speed:.3f}", (10, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(combined, "Arrow Keys: Yaw/Pitch | Q: Quit", (10, HEIGHT - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         cv2.imshow(window_name, combined)
-        if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+        # Handle keyboard input
+        if mode == 'demo':
+            key = cv2.waitKeyEx(1)  # waitKeyEx gives better arrow key support
+        else:
+            key = cv2.waitKey(1)
+
+        if key == ord('q') or key == ord('Q'):
+            break
+        elif mode == 'demo' and key != -1:
+            # Arrow keys for adjusting rotation speeds
+            # Arrow key codes: Up=2490368, Down=2621440, Left=2424832, Right=2555904 (common values)
+            # Also handle: Up=82/0, Down=84/1, Left=81/2, Right=83/3 (alternative codes)
+            if key == 2490368 or key == 82 or key == 0:  # Up arrow
+                pitch_speed += SPEED_INCREMENT
+                print(f"Pitch speed increased to {pitch_speed:.3f}")
+            elif key == 2621440 or key == 84 or key == 1:  # Down arrow
+                pitch_speed -= SPEED_INCREMENT
+                print(f"Pitch speed decreased to {pitch_speed:.3f}")
+            elif key == 2424832 or key == 81 or key == 2:  # Left arrow
+                yaw_speed -= SPEED_INCREMENT
+                print(f"Yaw speed decreased to {yaw_speed:.3f}")
+            elif key == 2555904 or key == 83 or key == 3:  # Right arrow
+                yaw_speed += SPEED_INCREMENT
+                print(f"Yaw speed increased to {yaw_speed:.3f}")
 
     cv2.destroyWindow(window_name)
     renderer.close()
-    
-    if mode == 'reference':
+
+    if mode in ['reference', 'inference']:
         return working_memory.get_memory()
     return None
 
 
+def save_memories(memories_dict, output_dir='memories'):
+    """Save object memories to a JSON file."""
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join(output_dir, f"memories_{timestamp}.json")
+
+    # Convert numpy arrays to lists for JSON serialization
+    serializable_dict = {}
+    for obj_name, memory in memories_dict.items():
+        serializable_dict[obj_name] = memory.tolist() if isinstance(memory, np.ndarray) else memory
+
+    with open(filename, 'w') as f:
+        json.dump(serializable_dict, f)
+
+    print(f"✓ Memories saved to {filename}")
+    return filename
+
+
 def main():
     parser = argparse.ArgumentParser(description='Run RL agent for object discrimination.')
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'inference', 'demo'], help='Mode: train, inference, or demo.')
     parser.add_argument('--ref', type=str, default='dog', help='Name of the reference object.')
     parser.add_argument('--targets', type=str, nargs='+', default=None, help='Names of target objects to discriminate (space-separated). If not provided, uses all objects except reference.')
     parser.add_argument('--num_episodes', type=int, default=10, help='Number of training episodes (each episode randomly selects a target object).')
+    parser.add_argument('--agent_path', type=str, default='agent.pt', help='Path to save/load agent weights.')
+    parser.add_argument('--memory_dir', type=str, default='memories', help='Directory to save memories.')
+    parser.add_argument('--demo_obj', type=str, default='dog', help='Object to display in demo mode.')
     args = parser.parse_args()
 
     # --- RL: Define state and action dimensions ---
@@ -439,60 +527,131 @@ def main():
     # --- RL: Instantiate the agent ---
     agent = DiscriminationAgent(state_dim, TOTAL_ACTIONS)
 
-    # --- PHASE 1: Build reference memory ---
-    print("\n" + "="*80)
-    print(f"PHASE 1: Building reference memory for '{args.ref}'...")
-    ref_xml_path = os.path.join(OBJECTS_DIR, args.ref, f"{args.ref}.xml")
-    if not os.path.exists(ref_xml_path):
-        print(f"Error: Reference object '{args.ref}' not found."); return
+    if args.mode == 'train':
+        # --- PHASE 1: Build reference memory ---
+        print("\n" + "="*80)
+        print(f"PHASE 1: Building reference memory for '{args.ref}'...")
+        ref_xml_path = os.path.join(OBJECTS_DIR, args.ref, f"{args.ref}.xml")
+        if not os.path.exists(ref_xml_path):
+            print(f"Error: Reference object '{args.ref}' not found."); return
 
-    reference_memory = run_simulation(ref_xml_path, args.ref, mode='reference')
-    print(f"✓ Reference memory for '{args.ref}' created.")
-    print("="*80 + "\n")
+        reference_memory = run_simulation(ref_xml_path, args.ref, mode='reference')
+        print(f"✓ Reference memory for '{args.ref}' created.")
+        print("="*80 + "\n")
 
-    # --- Discover or validate target objects ---
-    if args.targets is None:
-        # Auto-discover all objects except reference
-        all_objects = [d for d in os.listdir(OBJECTS_DIR) if os.path.isdir(os.path.join(OBJECTS_DIR, d)) and d != args.ref]
-        targets = all_objects
-        print(f"Auto-discovered {len(targets)} target objects: {targets}")
-    else:
-        targets = args.targets
-        print(f"Using specified target objects: {targets}")
-
-    # Validate all target objects exist
-    target_xml_paths = {}
-    for obj in targets:
-        xml_path = os.path.join(OBJECTS_DIR, obj, f"{obj}.xml")
-        if not os.path.exists(xml_path):
-            print(f"Warning: Target object '{obj}' not found, skipping.")
+        # --- Discover or validate target objects ---
+        if args.targets is None:
+            # Auto-discover all objects except reference
+            all_objects = [d for d in os.listdir(OBJECTS_DIR) if os.path.isdir(os.path.join(OBJECTS_DIR, d)) and d != args.ref]
+            targets = all_objects
+            print(f"Auto-discovered {len(targets)} target objects: {targets}")
         else:
-            target_xml_paths[obj] = xml_path
+            targets = args.targets
+            print(f"Using specified target objects: {targets}")
 
-    if not target_xml_paths:
-        print("Error: No valid target objects found."); return
+        # Validate all target objects exist
+        target_xml_paths = {}
+        for obj in targets:
+            xml_path = os.path.join(OBJECTS_DIR, obj, f"{obj}.xml")
+            if not os.path.exists(xml_path):
+                print(f"Warning: Target object '{obj}' not found, skipping.")
+            else:
+                target_xml_paths[obj] = xml_path
 
-    print(f"Training on {len(target_xml_paths)} objects: {list(target_xml_paths.keys())}")
-    print("="*80 + "\n")
+        if not target_xml_paths:
+            print("Error: No valid target objects found."); return
 
-    # --- PHASE 2: Train agent on multiple target objects ---
-    print("="*80)
-    print(f"PHASE 2: Training agent for {args.num_episodes} episodes...")
-    print(f"Each episode randomly selects from: {list(target_xml_paths.keys())}")
-    print("="*80 + "\n")
+        print(f"Training on {len(target_xml_paths)} objects: {list(target_xml_paths.keys())}")
+        print("="*80 + "\n")
 
-    for episode in range(args.num_episodes):
-        # Randomly select a target object for this episode
-        target_obj = random.choice(list(target_xml_paths.keys()))
-        target_xml_path = target_xml_paths[target_obj]
+        # --- PHASE 2: Train agent on multiple target objects ---
+        print("="*80)
+        print(f"PHASE 2: Training agent for {args.num_episodes} episodes...")
+        print(f"Each episode randomly selects from: {list(target_xml_paths.keys())}")
+        print("="*80 + "\n")
 
-        print(f"\n--- Episode {episode + 1}/{args.num_episodes}: Training on '{target_obj}' ---")
-        run_simulation(target_xml_path, target_obj, agent=agent, reference_memory=reference_memory, mode='train')
-        print(f"✓ Episode {episode + 1} complete!")
+        for episode in range(args.num_episodes):
+            # Randomly select a target object for this episode
+            target_obj = random.choice(list(target_xml_paths.keys()))
+            target_xml_path = target_xml_paths[target_obj]
 
-    print("\n" + "="*80)
-    print("✓ All training complete!")
-    print("="*80)
+            print(f"\n--- Episode {episode + 1}/{args.num_episodes}: Training on '{target_obj}' ---")
+            run_simulation(target_xml_path, target_obj, agent=agent, reference_memory=reference_memory, mode='train')
+            print(f"✓ Episode {episode + 1} complete!")
+
+        print("\n" + "="*80)
+        print("✓ All training complete!")
+        print("="*80)
+
+        # Save trained agent
+        agent.save(args.agent_path)
+
+    elif args.mode == 'inference':
+        # Load trained agent
+        if not os.path.exists(args.agent_path):
+            print(f"Error: Agent checkpoint '{args.agent_path}' not found."); return
+        agent.load(args.agent_path)
+
+        # --- Discover or validate target objects ---
+        if args.targets is None:
+            # Auto-discover all objects (including reference)
+            all_objects = [d for d in os.listdir(OBJECTS_DIR) if os.path.isdir(os.path.join(OBJECTS_DIR, d))]
+            targets = all_objects
+            print(f"Auto-discovered {len(targets)} objects: {targets}")
+        else:
+            targets = args.targets
+            print(f"Using specified objects: {targets}")
+
+        # Validate all objects exist
+        object_xml_paths = {}
+        for obj in targets:
+            xml_path = os.path.join(OBJECTS_DIR, obj, f"{obj}.xml")
+            if not os.path.exists(xml_path):
+                print(f"Warning: Object '{obj}' not found, skipping.")
+            else:
+                object_xml_paths[obj] = xml_path
+
+        if not object_xml_paths:
+            print("Error: No valid objects found."); return
+
+        print(f"\n" + "="*80)
+        print(f"INFERENCE MODE: Generating memories for {len(object_xml_paths)} objects")
+        print("="*80 + "\n")
+
+        # Generate memories for all objects
+        memories = {}
+        for obj_name, xml_path in object_xml_paths.items():
+            print(f"Processing '{obj_name}'...")
+            memory = run_simulation(xml_path, obj_name, agent=agent, mode='inference')
+            memories[obj_name] = memory
+            print(f"✓ Memory for '{obj_name}' generated.\n")
+
+        print("="*80)
+        print("✓ All memories generated!")
+        print("="*80 + "\n")
+
+        # Save memories
+        save_memories(memories, output_dir=args.memory_dir)
+
+    elif args.mode == 'demo':
+        # --- DEMO MODE: Manual control of object rotation ---
+        print("\n" + "="*80)
+        print(f"DEMO MODE: Viewing '{args.demo_obj}'")
+        print("="*80)
+        print("Controls:")
+        print("  Arrow Keys: Adjust yaw (left/right) and pitch (up/down) speeds")
+        print("  Q: Quit")
+        print("="*80 + "\n")
+
+        demo_xml_path = os.path.join(OBJECTS_DIR, args.demo_obj, f"{args.demo_obj}.xml")
+        if not os.path.exists(demo_xml_path):
+            print(f"Error: Demo object '{args.demo_obj}' not found."); return
+
+        run_simulation(demo_xml_path, args.demo_obj, mode='demo')
+
+        print("\n" + "="*80)
+        print("✓ Demo complete!")
+        print("="*80)
 
 
 if __name__ == "__main__":

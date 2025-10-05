@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""
+Analyze object memories using dimensionality reduction (t-SNE, PCA, UMAP).
+Loads memories from JSON files and creates visualizations.
+"""
+
+import json
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
+import argparse
+import os
+
+
+def load_memories(json_path):
+    """Load memories from a JSON file."""
+    with open(json_path, 'r') as f:
+        memories_dict = json.load(f)
+
+    # Convert lists back to numpy arrays
+    for obj_name in memories_dict:
+        memories_dict[obj_name] = np.array(memories_dict[obj_name])
+
+    return memories_dict
+
+
+def analyze_memories(memories_dict, method='tsne', output_dir='analysis'):
+    """
+    Perform dimensionality reduction on memories and create visualizations.
+
+    Args:
+        memories_dict: Dictionary mapping object names to memory vectors
+        method: 'tsne', 'pca', or 'both'
+        output_dir: Directory to save plots
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Prepare data
+    object_names = list(memories_dict.keys())
+    memory_vectors = np.array([memories_dict[name] for name in object_names])
+
+    print(f"Analyzing {len(object_names)} objects")
+    print(f"Memory vector dimension: {memory_vectors.shape[1]}")
+
+    # Compute pairwise similarities
+    print("\nComputing pairwise cosine similarities...")
+    similarities = np.zeros((len(object_names), len(object_names)))
+    for i in range(len(object_names)):
+        for j in range(len(object_names)):
+            # Cosine similarity
+            dot_product = np.dot(memory_vectors[i], memory_vectors[j])
+            norm_i = np.linalg.norm(memory_vectors[i])
+            norm_j = np.linalg.norm(memory_vectors[j])
+            similarities[i, j] = dot_product / (norm_i * norm_j) if norm_i > 0 and norm_j > 0 else 0
+
+    # Print similarity matrix
+    print("\nCosine Similarity Matrix:")
+    print("".join([f"{name:12s}" for name in object_names]))
+    for i, name in enumerate(object_names):
+        print(f"{name:12s}" + "".join([f"{similarities[i, j]:12.4f}" for j in range(len(object_names))]))
+
+    # Create similarity heatmap
+    plt.figure(figsize=(10, 8))
+    plt.imshow(similarities, cmap='viridis', aspect='auto')
+    plt.colorbar(label='Cosine Similarity')
+    plt.xticks(range(len(object_names)), object_names, rotation=45, ha='right')
+    plt.yticks(range(len(object_names)), object_names)
+    plt.title('Pairwise Cosine Similarity of Object Memories')
+    plt.tight_layout()
+    heatmap_path = os.path.join(output_dir, 'similarity_heatmap.png')
+    plt.savefig(heatmap_path, dpi=150)
+    print(f"\n✓ Similarity heatmap saved to {heatmap_path}")
+    plt.close()
+
+    # Perform dimensionality reduction
+    if method in ['pca', 'both']:
+        print("\nPerforming PCA...")
+        pca = PCA(n_components=2)
+        pca_result = pca.fit_transform(memory_vectors)
+
+        # Plot PCA
+        plt.figure(figsize=(10, 8))
+        plt.scatter(pca_result[:, 0], pca_result[:, 1], s=100, alpha=0.6)
+        for i, name in enumerate(object_names):
+            plt.annotate(name, (pca_result[i, 0], pca_result[i, 1]),
+                        fontsize=12, ha='center', va='bottom')
+        plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%} variance)')
+        plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%} variance)')
+        plt.title('PCA Projection of Object Memories')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        pca_path = os.path.join(output_dir, 'pca_projection.png')
+        plt.savefig(pca_path, dpi=150)
+        print(f"✓ PCA plot saved to {pca_path}")
+        plt.close()
+
+    if method in ['tsne', 'both']:
+        print("\nPerforming t-SNE (this may take a moment)...")
+        tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(object_names) - 1))
+        tsne_result = tsne.fit_transform(memory_vectors)
+
+        # Plot t-SNE
+        plt.figure(figsize=(10, 8))
+        plt.scatter(tsne_result[:, 0], tsne_result[:, 1], s=100, alpha=0.6)
+        for i, name in enumerate(object_names):
+            plt.annotate(name, (tsne_result[i, 0], tsne_result[i, 1]),
+                        fontsize=12, ha='center', va='bottom')
+        plt.xlabel('t-SNE Dimension 1')
+        plt.ylabel('t-SNE Dimension 2')
+        plt.title('t-SNE Projection of Object Memories')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        tsne_path = os.path.join(output_dir, 'tsne_projection.png')
+        plt.savefig(tsne_path, dpi=150)
+        print(f"✓ t-SNE plot saved to {tsne_path}")
+        plt.close()
+
+    # Try UMAP if available
+    try:
+        import umap
+        print("\nPerforming UMAP...")
+        umap_model = umap.UMAP(n_components=2, random_state=42,
+                               n_neighbors=min(15, len(object_names) - 1))
+        umap_result = umap_model.fit_transform(memory_vectors)
+
+        # Plot UMAP
+        plt.figure(figsize=(10, 8))
+        plt.scatter(umap_result[:, 0], umap_result[:, 1], s=100, alpha=0.6)
+        for i, name in enumerate(object_names):
+            plt.annotate(name, (umap_result[i, 0], umap_result[i, 1]),
+                        fontsize=12, ha='center', va='bottom')
+        plt.xlabel('UMAP Dimension 1')
+        plt.ylabel('UMAP Dimension 2')
+        plt.title('UMAP Projection of Object Memories')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        umap_path = os.path.join(output_dir, 'umap_projection.png')
+        plt.savefig(umap_path, dpi=150)
+        print(f"✓ UMAP plot saved to {umap_path}")
+        plt.close()
+    except ImportError:
+        print("\nNote: UMAP not available. Install with: pip install umap-learn")
+
+    print("\n" + "="*80)
+    print("✓ Analysis complete!")
+    print("="*80)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Analyze object memories with dimensionality reduction.')
+    parser.add_argument('memory_file', type=str, help='Path to memories JSON file.')
+    parser.add_argument('--method', type=str, default='both', choices=['tsne', 'pca', 'both'],
+                       help='Dimensionality reduction method (default: both).')
+    parser.add_argument('--output_dir', type=str, default='analysis',
+                       help='Directory to save analysis plots (default: analysis).')
+    args = parser.parse_args()
+
+    if not os.path.exists(args.memory_file):
+        print(f"Error: Memory file '{args.memory_file}' not found.")
+        return
+
+    print("="*80)
+    print(f"Loading memories from {args.memory_file}...")
+    print("="*80)
+
+    memories = load_memories(args.memory_file)
+    analyze_memories(memories, method=args.method, output_dir=args.output_dir)
+
+
+if __name__ == "__main__":
+    main()
