@@ -22,6 +22,7 @@ import random
 from collections import deque
 import math
 import json
+import re
 from datetime import datetime
 
 # Add IEBCS to path
@@ -42,6 +43,7 @@ CAMERA_NAME = None  # Use default camera
 INITIAL_YAW_SPEED = 0.05
 INITIAL_PITCH_SPEED = 0.0
 SPEED_INCREMENT = 0.01
+MIN_SPEED = 0.01  # Minimum absolute speed to prevent static objects
 
 # DVS Sensor parameters
 TH_POS = 0.4
@@ -80,6 +82,25 @@ EPSILON_START = 0.9
 EPSILON_END = 0.05
 EPSILON_DECAY = 1000
 TARGET_UPDATE_FREQ = 10     # Update target network every 10 episodes/steps
+
+def enforce_minimum_speed(yaw_speed, pitch_speed, min_speed=MIN_SPEED):
+    """
+    Enforce minimum rotation speed to prevent static objects.
+    If both speeds are too small, boost at least one to the minimum.
+    """
+    yaw_mag = abs(yaw_speed)
+    pitch_mag = abs(pitch_speed)
+
+    # If both speeds are below minimum, ensure at least one meets the minimum
+    if yaw_mag < min_speed and pitch_mag < min_speed:
+        # Boost the larger one (or yaw if equal)
+        if yaw_mag >= pitch_mag:
+            yaw_speed = min_speed if yaw_speed >= 0 else -min_speed
+        else:
+            pitch_speed = min_speed if pitch_speed >= 0 else -min_speed
+
+    return yaw_speed, pitch_speed
+
 
 # --- RL: Helper function to get top K saliency points ---
 def get_top_k_saliency_coords(saliency_map, k):
@@ -285,15 +306,21 @@ class EventFrameRenderer:
         return cv2.applyColorMap(img_uint8, cv2.COLORMAP_VIRIDIS)
 
 # --- RL: Modified main rendering function for RL integration ---
-def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='display'):
+def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='display',
+                   obj_class=None, memory_classes=None):
     """
     Main simulation function, adapted for different modes.
     Modes:
     - 'display': Just shows the rotating object (original behavior).
-    - 'reference': Builds and returns a memory of a reference object.
-    - 'train': Runs the RL loop to train the agent.
+    - 'reference': Builds and returns a memory of a reference object (uses bottom-up saccades).
+    - 'train': Runs the RL loop to train the agent using contrastive learning.
     - 'inference': Uses learned policy to explore and returns memory.
     - 'demo': Interactive mode with manual rotation control via arrow keys.
+
+    Args:
+        reference_memory: List of memory arrays from all previously seen objects.
+        obj_class: Class label for current object (for contrastive learning).
+        memory_classes: List of class labels corresponding to reference_memory arrays.
     """
     model = mujoco.MjModel.from_xml_path(xml_path)
     data = mujoco.MjData(model)
@@ -332,7 +359,13 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
     cv2.resizeWindow(window_name, WIDTH * 2, HEIGHT)
 
     yaw_angle, pitch_angle = 0.0, 0.0
-    yaw_speed, pitch_speed = (INITIAL_YAW_SPEED, 0.0) if mode not in ['train', 'inference'] else (0.0, 0.0)
+    if mode not in ['train', 'inference']:
+        yaw_speed, pitch_speed = INITIAL_YAW_SPEED, 0.0
+    else:
+        yaw_speed, pitch_speed = INITIAL_YAW_SPEED, 0.0  # Start with minimum movement
+
+    # Enforce minimum speed from the start
+    yaw_speed, pitch_speed = enforce_minimum_speed(yaw_speed, pitch_speed)
 
     # TODO: use more ref steps (e.g. 2000) if it works and we can run it on a GPU
     max_steps = 200 if mode in ['reference', 'inference'] else 200 # Shorter for ref, longer for training
@@ -388,7 +421,31 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
 
             current_state = np.concatenate([current_mem, top_k_coords_normalized])
             if mode == 'train':
-                sim_before = F.cosine_similarity(torch.Tensor(reference_memory), torch.Tensor(current_mem), dim=0).item()
+                # Contrastive learning: separate same-class from different-class memories
+                if isinstance(reference_memory, list) and memory_classes is not None:
+                    same_class_sims_before = []
+                    other_class_sims_before = []
+
+                    for ref_mem, ref_class in zip(reference_memory, memory_classes):
+                        sim = F.cosine_similarity(torch.Tensor(ref_mem), torch.Tensor(current_mem), dim=0).item()
+                        if ref_class == obj_class:
+                            same_class_sims_before.append(sim)
+                        else:
+                            other_class_sims_before.append(sim)
+
+                    # Store for later reward calculation
+                    sim_to_same_before = max(same_class_sims_before) if same_class_sims_before else 0.0
+                    sim_to_other_before = max(other_class_sims_before) if other_class_sims_before else 0.0
+                else:
+                    # Fallback for non-contrastive mode
+                    if isinstance(reference_memory, list):
+                        similarities_before = [F.cosine_similarity(torch.Tensor(ref_mem), torch.Tensor(current_mem), dim=0).item()
+                                              for ref_mem in reference_memory]
+                        sim_before = max(similarities_before)
+                    else:
+                        sim_before = F.cosine_similarity(torch.Tensor(reference_memory), torch.Tensor(current_mem), dim=0).item()
+                    sim_to_same_before = 0.0
+                    sim_to_other_before = sim_before
 
             # 4. CHOOSE AND EXECUTE ACTION
             if mode == 'train':
@@ -403,6 +460,9 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
                 elif action_idx == 2: pitch_speed += SPEED_INCREMENT
                 elif action_idx == 3: pitch_speed -= SPEED_INCREMENT
                 # action_idx == 4 is do_nothing
+
+                # Enforce minimum speed to prevent static objects
+                yaw_speed, pitch_speed = enforce_minimum_speed(yaw_speed, pitch_speed)
                 saccade_target = salmax_coords # Default saccade
             else:
                 # It's a saccade action
@@ -429,8 +489,37 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
         if mode == 'train' and agent is not None and current_state is not None:
             # 6. CALCULATE REWARD & STORE EXPERIENCE
             next_mem = working_memory.get_memory()
-            sim_after = F.cosine_similarity(torch.Tensor(reference_memory), torch.Tensor(next_mem), dim=0).item()
-            reward = sim_before - sim_after # Reward for *reducing* similarity
+
+            # Contrastive learning reward
+            if isinstance(reference_memory, list) and memory_classes is not None:
+                same_class_sims_after = []
+                other_class_sims_after = []
+
+                for ref_mem, ref_class in zip(reference_memory, memory_classes):
+                    sim = F.cosine_similarity(torch.Tensor(ref_mem), torch.Tensor(next_mem), dim=0).item()
+                    if ref_class == obj_class:
+                        same_class_sims_after.append(sim)
+                    else:
+                        other_class_sims_after.append(sim)
+
+                sim_to_same_after = max(same_class_sims_after) if same_class_sims_after else 0.0
+                sim_to_other_after = max(other_class_sims_after) if other_class_sims_after else 0.0
+
+                # Reward: increase similarity to same class + decrease similarity to other classes
+                reward_same = (sim_to_same_after - sim_to_same_before)  # Positive if becoming more similar to same class
+                reward_other = (sim_to_other_before - sim_to_other_after)  # Positive if becoming less similar to other classes
+
+                # Combine rewards
+                reward = reward_same + reward_other
+            else:
+                # Fallback for non-contrastive mode
+                if isinstance(reference_memory, list):
+                    similarities_after = [F.cosine_similarity(torch.Tensor(ref_mem), torch.Tensor(next_mem), dim=0).item()
+                                         for ref_mem in reference_memory]
+                    sim_after = max(similarities_after)
+                else:
+                    sim_after = F.cosine_similarity(torch.Tensor(reference_memory), torch.Tensor(next_mem), dim=0).item()
+                reward = sim_to_other_before - sim_after  # Reward for reducing similarity
 
             next_state = np.concatenate([next_mem, top_k_coords_normalized]) # Saliency map is from current step
             agent.remember(current_state, action_idx, reward, next_state)
@@ -440,7 +529,12 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
             if step % TARGET_UPDATE_FREQ == 0:
                 agent.update_target_net()
                 if loss is not None:
-                    print(f"Step {step}/{max_steps} | Loss: {loss:.4f} | Reward: {reward:.4f} | Epsilon: {agent.steps_done}")
+                    # Enhanced logging for contrastive learning
+                    if isinstance(reference_memory, list) and memory_classes is not None:
+                        print(f"Step {step}/{max_steps} | Loss: {loss:.4f} | Reward: {reward:.4f} "
+                              f"(same: {reward_same:.4f}, other: {reward_other:.4f}) | Epsilon: {agent.steps_done}")
+                    else:
+                        print(f"Step {step}/{max_steps} | Loss: {loss:.4f} | Reward: {reward:.4f} | Epsilon: {agent.steps_done}")
 
 
         # 6. VISUALIZE
@@ -473,15 +567,19 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
             # Also handle: Up=82/0, Down=84/1, Left=81/2, Right=83/3 (alternative codes)
             if key == 2490368 or key == 82 or key == 0:  # Up arrow
                 pitch_speed += SPEED_INCREMENT
+                yaw_speed, pitch_speed = enforce_minimum_speed(yaw_speed, pitch_speed)
                 print(f"Pitch speed increased to {pitch_speed:.3f}")
             elif key == 2621440 or key == 84 or key == 1:  # Down arrow
                 pitch_speed -= SPEED_INCREMENT
+                yaw_speed, pitch_speed = enforce_minimum_speed(yaw_speed, pitch_speed)
                 print(f"Pitch speed decreased to {pitch_speed:.3f}")
             elif key == 2424832 or key == 81 or key == 2:  # Left arrow
                 yaw_speed -= SPEED_INCREMENT
+                yaw_speed, pitch_speed = enforce_minimum_speed(yaw_speed, pitch_speed)
                 print(f"Yaw speed decreased to {yaw_speed:.3f}")
             elif key == 2555904 or key == 83 or key == 3:  # Right arrow
                 yaw_speed += SPEED_INCREMENT
+                yaw_speed, pitch_speed = enforce_minimum_speed(yaw_speed, pitch_speed)
                 print(f"Yaw speed increased to {yaw_speed:.3f}")
 
     cv2.destroyWindow(window_name)
@@ -492,30 +590,41 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
     return None
 
 
-def save_memories(memories_dict, output_dir='memories'):
+def save_memories(memories_dict, output_dir='memories', classes_dict=None):
     """Save object memories to a JSON file."""
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = os.path.join(output_dir, f"memories_{timestamp}.json")
 
     # Convert numpy arrays to lists for JSON serialization
-    serializable_dict = {}
+    data_to_save = {
+        'memories': {},
+        'classes': classes_dict if classes_dict else {}
+    }
+
     for obj_name, memory in memories_dict.items():
-        serializable_dict[obj_name] = memory.tolist() if isinstance(memory, np.ndarray) else memory
+        data_to_save['memories'][obj_name] = memory.tolist() if isinstance(memory, np.ndarray) else memory
 
     with open(filename, 'w') as f:
-        json.dump(serializable_dict, f)
+        json.dump(data_to_save, f, indent=2)
 
     print(f"✓ Memories saved to {filename}")
     return filename
 
 
+def get_object_instance_key(object_name, instance_id):
+    """
+    Create a unique key for an object instance.
+    Examples: ('dog', 0) -> 'dog_0', ('cat', 2) -> 'cat_2'
+    """
+    return f"{object_name}_{instance_id}"
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Run RL agent for object discrimination.')
+    parser = argparse.ArgumentParser(description='Run RL agent for contrastive object discrimination.')
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'inference', 'demo'], help='Mode: train, inference, or demo.')
-    parser.add_argument('--ref', type=str, default='dog', help='Name of the reference object.')
-    parser.add_argument('--targets', type=str, nargs='+', default=None, help='Names of target objects to discriminate (space-separated). If not provided, uses all objects except reference.')
-    parser.add_argument('--num_episodes', type=int, default=10, help='Number of training episodes (each episode randomly selects a target object).')
+    parser.add_argument('--objects', type=str, nargs='+', default=None, help='Names of objects to use (space-separated). Objects will be randomly sampled during training. If not provided, uses all available objects.')
+    parser.add_argument('--num_episodes', type=int, default=10, help='Number of training episodes (random samples from --objects).')
     parser.add_argument('--agent_path', type=str, default='agent.pt', help='Path to save/load agent weights.')
     parser.add_argument('--memory_dir', type=str, default='memories', help='Directory to save memories.')
     parser.add_argument('--demo_obj', type=str, default='dog', help='Object to display in demo mode.')
@@ -528,83 +637,19 @@ def main():
     agent = DiscriminationAgent(state_dim, TOTAL_ACTIONS)
 
     if args.mode == 'train':
-        # --- PHASE 1: Build reference memory ---
-        print("\n" + "="*80)
-        print(f"PHASE 1: Building reference memory for '{args.ref}'...")
-        ref_xml_path = os.path.join(OBJECTS_DIR, args.ref, f"{args.ref}.xml")
-        if not os.path.exists(ref_xml_path):
-            print(f"Error: Reference object '{args.ref}' not found."); return
-
-        reference_memory = run_simulation(ref_xml_path, args.ref, mode='reference')
-        print(f"✓ Reference memory for '{args.ref}' created.")
-        print("="*80 + "\n")
-
-        # --- Discover or validate target objects ---
-        if args.targets is None:
-            # Auto-discover all objects except reference
-            all_objects = [d for d in os.listdir(OBJECTS_DIR) if os.path.isdir(os.path.join(OBJECTS_DIR, d)) and d != args.ref]
-            targets = all_objects
-            print(f"Auto-discovered {len(targets)} target objects: {targets}")
-        else:
-            targets = args.targets
-            print(f"Using specified target objects: {targets}")
-
-        # Validate all target objects exist
-        target_xml_paths = {}
-        for obj in targets:
-            xml_path = os.path.join(OBJECTS_DIR, obj, f"{obj}.xml")
-            if not os.path.exists(xml_path):
-                print(f"Warning: Target object '{obj}' not found, skipping.")
-            else:
-                target_xml_paths[obj] = xml_path
-
-        if not target_xml_paths:
-            print("Error: No valid target objects found."); return
-
-        print(f"Training on {len(target_xml_paths)} objects: {list(target_xml_paths.keys())}")
-        print("="*80 + "\n")
-
-        # --- PHASE 2: Train agent on multiple target objects ---
-        print("="*80)
-        print(f"PHASE 2: Training agent for {args.num_episodes} episodes...")
-        print(f"Each episode randomly selects from: {list(target_xml_paths.keys())}")
-        print("="*80 + "\n")
-
-        for episode in range(args.num_episodes):
-            # Randomly select a target object for this episode
-            target_obj = random.choice(list(target_xml_paths.keys()))
-            target_xml_path = target_xml_paths[target_obj]
-
-            print(f"\n--- Episode {episode + 1}/{args.num_episodes}: Training on '{target_obj}' ---")
-            run_simulation(target_xml_path, target_obj, agent=agent, reference_memory=reference_memory, mode='train')
-            print(f"✓ Episode {episode + 1} complete!")
-
-        print("\n" + "="*80)
-        print("✓ All training complete!")
-        print("="*80)
-
-        # Save trained agent
-        agent.save(args.agent_path)
-
-    elif args.mode == 'inference':
-        # Load trained agent
-        if not os.path.exists(args.agent_path):
-            print(f"Error: Agent checkpoint '{args.agent_path}' not found."); return
-        agent.load(args.agent_path)
-
-        # --- Discover or validate target objects ---
-        if args.targets is None:
-            # Auto-discover all objects (including reference)
+        # --- Discover or validate objects ---
+        if args.objects is None:
+            # Auto-discover all objects
             all_objects = [d for d in os.listdir(OBJECTS_DIR) if os.path.isdir(os.path.join(OBJECTS_DIR, d))]
-            targets = all_objects
-            print(f"Auto-discovered {len(targets)} objects: {targets}")
+            objects = all_objects
+            print(f"Auto-discovered {len(objects)} objects: {objects}")
         else:
-            targets = args.targets
-            print(f"Using specified objects: {targets}")
+            objects = args.objects
+            print(f"Using specified objects: {objects}")
 
         # Validate all objects exist
         object_xml_paths = {}
-        for obj in targets:
+        for obj in objects:
             xml_path = os.path.join(OBJECTS_DIR, obj, f"{obj}.xml")
             if not os.path.exists(xml_path):
                 print(f"Warning: Object '{obj}' not found, skipping.")
@@ -615,23 +660,148 @@ def main():
             print("Error: No valid objects found."); return
 
         print(f"\n" + "="*80)
-        print(f"INFERENCE MODE: Generating memories for {len(object_xml_paths)} objects")
+        print(f"TRAINING: Randomly sampling from {len(object_xml_paths)} objects for {args.num_episodes} episodes")
+        print(f"Available objects: {list(object_xml_paths.keys())}")
         print("="*80 + "\n")
 
-        # Generate memories for all objects
-        memories = {}
-        for obj_name, xml_path in object_xml_paths.items():
-            print(f"Processing '{obj_name}'...")
-            memory = run_simulation(xml_path, obj_name, agent=agent, mode='inference')
-            memories[obj_name] = memory
-            print(f"✓ Memory for '{obj_name}' generated.\n")
+        # Dictionary to store all object instance memories and their classes
+        object_memories = {}
+        object_classes = {}
+        instance_counts = {obj_name: 0 for obj_name in object_xml_paths.keys()}
+
+        for episode in range(args.num_episodes):
+            # Randomly select an object for this episode
+            obj_name = random.choice(list(object_xml_paths.keys()))
+            xml_path = object_xml_paths[obj_name]
+            obj_class = obj_name  # The class is just the object name itself
+
+            # Create unique instance key
+            instance_key = get_object_instance_key(obj_name, instance_counts[obj_name])
+            instance_counts[obj_name] += 1
+
+            print("="*80)
+            if episode == 0:
+                # First episode: use reference mode (pure bottom-up saccades)
+                print(f"EPISODE {episode + 1}/{args.num_episodes}: '{instance_key}' (class: {obj_class}, baseline)")
+                print("="*80 + "\n")
+                memory = run_simulation(xml_path, instance_key, mode='reference')
+                object_memories[instance_key] = memory
+                object_classes[instance_key] = obj_class
+                print(f"\n✓ Baseline memory for '{instance_key}' created.")
+            else:
+                # Subsequent episodes: train agent using contrastive learning
+                previous_instance_keys = list(object_memories.keys())
+                same_class_instances = [key for key in previous_instance_keys if object_classes[key] == obj_class]
+                other_class_instances = [key for key in previous_instance_keys if object_classes[key] != obj_class]
+                unique_other_classes = set([object_classes[key] for key in other_class_instances])
+
+                print(f"EPISODE {episode + 1}/{args.num_episodes}: '{instance_key}' (class: {obj_class})")
+                if same_class_instances:
+                    print(f"  Same class ({obj_class}) instances seen: {len(same_class_instances)}")
+                if unique_other_classes:
+                    print(f"  Different classes seen: {sorted(unique_other_classes)} ({len(other_class_instances)} instances)")
+                print("="*80 + "\n")
+
+                # Convert memories dict to lists for passing to run_simulation
+                previous_memories = [object_memories[key] for key in previous_instance_keys]
+                previous_classes = [object_classes[key] for key in previous_instance_keys]
+
+                # Train on this object instance
+                run_simulation(xml_path, instance_key, agent=agent,
+                             reference_memory=previous_memories, mode='train',
+                             obj_class=obj_class, memory_classes=previous_classes)
+
+                # After training, generate final memory for this instance
+                print(f"\nGenerating final memory for '{instance_key}'...")
+                memory = run_simulation(xml_path, instance_key, agent=agent, mode='inference')
+                object_memories[instance_key] = memory
+                object_classes[instance_key] = obj_class
+                print(f"✓ Memory for '{instance_key}' saved.")
+
+            print("="*80 + "\n")
+
+        print("\n" + "="*80)
+        print("✓ All training complete!")
+        print(f"\nFinal statistics:")
+        print(f"  Total instances: {len(object_memories)}")
+        print(f"  Unique classes: {len(set(object_classes.values()))}")
+        for obj_name in sorted(object_xml_paths.keys()):
+            count = instance_counts[obj_name]
+            print(f"  {obj_name}: {count} instance(s)")
+        print("="*80)
+
+        # Save trained agent
+        agent.save(args.agent_path)
+
+        # Save all object memories with class information
+        save_memories(object_memories, output_dir=args.memory_dir, classes_dict=object_classes)
+
+    elif args.mode == 'inference':
+        # Load trained agent
+        if not os.path.exists(args.agent_path):
+            print(f"Error: Agent checkpoint '{args.agent_path}' not found."); return
+        agent.load(args.agent_path)
+
+        # --- Discover or validate objects ---
+        if args.objects is None:
+            # Auto-discover all objects
+            all_objects = [d for d in os.listdir(OBJECTS_DIR) if os.path.isdir(os.path.join(OBJECTS_DIR, d))]
+            objects = all_objects
+            print(f"Auto-discovered {len(objects)} objects: {objects}")
+        else:
+            objects = args.objects
+            print(f"Using specified objects: {objects}")
+
+        # Validate all objects exist
+        object_xml_paths = {}
+        for obj in objects:
+            xml_path = os.path.join(OBJECTS_DIR, obj, f"{obj}.xml")
+            if not os.path.exists(xml_path):
+                print(f"Warning: Object '{obj}' not found, skipping.")
+            else:
+                object_xml_paths[obj] = xml_path
+
+        if not object_xml_paths:
+            print("Error: No valid objects found."); return
+
+        print(f"\n" + "="*80)
+        print(f"INFERENCE MODE: Randomly sampling from {len(object_xml_paths)} objects for {args.num_episodes} episodes")
+        print(f"Available objects: {list(object_xml_paths.keys())}")
+        print("="*80 + "\n")
+
+        # Dictionary to store all object instance memories and their classes
+        object_memories = {}
+        object_classes = {}
+        instance_counts = {obj_name: 0 for obj_name in object_xml_paths.keys()}
+
+        for episode in range(args.num_episodes):
+            # Randomly select an object for this episode
+            obj_name = random.choice(list(object_xml_paths.keys()))
+            xml_path = object_xml_paths[obj_name]
+            obj_class = obj_name  # The class is just the object name itself
+
+            # Create unique instance key
+            instance_key = get_object_instance_key(obj_name, instance_counts[obj_name])
+            instance_counts[obj_name] += 1
+
+            print(f"Episode {episode + 1}/{args.num_episodes}: Generating memory for '{instance_key}'...")
+            memory = run_simulation(xml_path, instance_key, agent=agent, mode='inference')
+            object_memories[instance_key] = memory
+            object_classes[instance_key] = obj_class
+            print(f"✓ Memory for '{instance_key}' generated.\n")
 
         print("="*80)
         print("✓ All memories generated!")
+        print(f"\nFinal statistics:")
+        print(f"  Total instances: {len(object_memories)}")
+        print(f"  Unique classes: {len(set(object_classes.values()))}")
+        for obj_name in sorted(object_xml_paths.keys()):
+            count = instance_counts[obj_name]
+            print(f"  {obj_name}: {count} instance(s)")
         print("="*80 + "\n")
 
-        # Save memories
-        save_memories(memories, output_dir=args.memory_dir)
+        # Save memories with class information
+        save_memories(object_memories, output_dir=args.memory_dir, classes_dict=object_classes)
 
     elif args.mode == 'demo':
         # --- DEMO MODE: Manual control of object rotation ---
