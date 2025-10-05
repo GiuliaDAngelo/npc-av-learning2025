@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 MuJoCo rendering with real-time event conversion using IEBCS.
-Displays original rendered view and event frames side-by-side.
-Optional saccade detection using attention mechanism.
+Includes a Deep Q-Learning agent to actively control object rotation and saccades
+for a discrimination task.
 """
 
 import mujoco
@@ -12,9 +12,15 @@ import cv2
 import sys
 import argparse
 import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
 import torchvision.transforms as T
 from PIL import Image
 import sspspace
+import random
+from collections import deque
+import math
 
 # Add IEBCS to path
 sys.path.append("IEBCS/src")
@@ -31,524 +37,464 @@ HEIGHT = 480
 CAMERA_NAME = None  # Use default camera
 
 # Rotation control parameters
-INITIAL_YAW_SPEED = 0.05   # Initial rotation speed around Z-axis (radians per frame)
-INITIAL_PITCH_SPEED = 0.0  # Initial rotation speed around Y-axis (radians per frame)
-SPEED_INCREMENT = 0.01     # How much speed changes with arrow keys
+INITIAL_YAW_SPEED = 0.05
+INITIAL_PITCH_SPEED = 0.0
+SPEED_INCREMENT = 0.01
 
-# DVS Sensor parameters (from IEBCS example)
-TH_POS = 0.4        # ON threshold = 50% (ln(1.5) = 0.4)
-TH_NEG = 0.4        # OFF threshold = 50%
-TH_NOISE = 0.01     # standard deviation of threshold noise
-LAT = 100           # latency in us
-TAU = 40            # front-end time constant at 1 klux in us
-JIT = 10            # temporal jitter standard deviation in us
-BGNP = 0.1          # ON event noise rate in events / pixel / s
-BGNN = 0.01         # OFF event noise rate in events / pixel / s
-REF = 100           # refractory period in us
-DT = 33333          # time between frames in us (30 fps)
+# DVS Sensor parameters
+TH_POS = 0.4
+TH_NEG = 0.4
+TH_NOISE = 0.01
+LAT = 100
+TAU = 40
+JIT = 10
+BGNP = 0.1
+BGNN = 0.01
+REF = 100
+DT = 33333
 
-# Attention mechanism parameters (from Code0GenerateBboxes)
+# Attention mechanism parameters
 ATTENTION_PARAMS = {
-    'size_krn': 16,
-    'r0': 14,
-    'rho': 0.05,
-    'theta': np.pi * 3 / 2,
-    'thetas': np.arange(0, 2 * np.pi, np.pi / 4),
-    'thick': 3,
-    'fltr_resize_perc': [2, 2],
-    'offsetpxs': 0,
-    'offset': (0, 0),
-    'num_pyr': 6,
-    'tau_mem': 0.3,
-    'stride': 1,
-    'out_ch': 1
+    'size_krn': 16, 'r0': 14, 'rho': 0.05, 'theta': np.pi * 3 / 2,
+    'thetas': np.arange(0, 2 * np.pi, np.pi / 4), 'thick': 3,
+    'fltr_resize_perc': [2, 2], 'offsetpxs': 0, 'offset': (0, 0),
+    'num_pyr': 6, 'tau_mem': 0.3, 'stride': 1, 'out_ch': 1
 }
-ROI_SIZE = 100  # Size of saccade bounding box
-GAMMA = 0.99  # Memory update factor (from Code1CreateWorkingMemory)
+ROI_SIZE = 100
+GAMMA_VSA = 0.99  # VSA Memory update factor
+
+# --- RL: New constants for the Deep Q-Learning Agent ---
+K_SALIENCY = 5              # Agent can choose from top K salient points
+NUM_MOVE_ACTIONS = 5        # inc/dec yaw, inc/dec pitch, do_nothing
+NUM_SACCADE_ACTIONS = K_SALIENCY
+TOTAL_ACTIONS = NUM_MOVE_ACTIONS + NUM_SACCADE_ACTIONS
+SSP_DIM = 2500              # Must match WorkingMemory ssp_dim
+
+# RL Hyperparameters
+REPLAY_BUFFER_SIZE = 10000
+BATCH_SIZE = 32
+GAMMA_RL = 0.99             # RL discount factor
+EPSILON_START = 0.9
+EPSILON_END = 0.05
+EPSILON_DECAY = 1000
+TARGET_UPDATE_FREQ = 10     # Update target network every 10 episodes/steps
+
+# --- RL: Helper function to get top K saliency points ---
+def get_top_k_saliency_coords(saliency_map, k):
+    """Finds the coordinates of the top K values in a saliency map."""
+    # Flatten the map to find the top K values' indices
+    flat_map = saliency_map.flatten()
+    # Use argpartition for efficiency; it finds the K-th largest element's index
+    # and ensures all elements after it are larger.
+    # We negate the array to find the largest values.
+    try:
+        top_k_indices = np.argpartition(-flat_map, k)[:k]
+    except ValueError: # Handle cases where map has fewer than K non-zero elements
+        top_k_indices = np.argsort(-flat_map)[:k]
+
+    # Convert the flat indices back to 2D coordinates
+    coords = np.unravel_index(top_k_indices, saliency_map.shape)
+    # Return as a list of (y, x) tuples
+    return list(zip(coords[0], coords[1]))
+
+
+# --- RL: Deep Q-Network Agent Implementation ---
+class DiscriminationAgent:
+    def __init__(self, state_dim, num_actions):
+        self.state_dim = state_dim
+        self.num_actions = num_actions
+        self.device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+        print(f"  RL Agent using device: {self.device}")
+
+        # Q-Network and Target Network for stability
+        self.policy_net = self._create_network().to(self.device)
+        self.target_net = self._create_network().to(self.device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()  # Target network is only for inference
+
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=0.001)
+        self.replay_buffer = deque(maxlen=REPLAY_BUFFER_SIZE)
+        self.steps_done = 0
+
+    def _create_network(self):
+        """Creates the neural network architecture."""
+        return nn.Sequential(
+            nn.Linear(self.state_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, self.num_actions)
+        )
+
+    def choose_action(self, state):
+        """Chooses an action using an epsilon-greedy policy."""
+        # Epsilon decay
+        epsilon = EPSILON_END + (EPSILON_START - EPSILON_END) * \
+                  math.exp(-1. * self.steps_done / EPSILON_DECAY)
+        self.steps_done += 1
+
+        if random.random() > epsilon:
+            # Exploit: choose the best action from the policy network
+            with torch.no_grad():
+                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+                q_values = self.policy_net(state_tensor)
+                return torch.argmax(q_values).item()
+        else:
+            # Explore: choose a random action
+            return random.randrange(self.num_actions)
+
+    def remember(self, state, action, reward, next_state):
+        """Stores an experience tuple in the replay buffer."""
+        self.replay_buffer.append((state, action, reward, next_state))
+
+    def replay(self):
+        """Trains the policy network using a batch of experiences from the buffer."""
+        if len(self.replay_buffer) < BATCH_SIZE:
+            return  # Not enough experiences to train
+
+        # Sample a random batch
+        minibatch = random.sample(self.replay_buffer, BATCH_SIZE)
+        states, actions, rewards, next_states = zip(*minibatch)
+
+        # Convert to tensors
+        states = torch.FloatTensor(np.array(states)).to(self.device)
+        actions = torch.LongTensor(actions).unsqueeze(1).to(self.device)
+        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(self.device)
+        next_states = torch.FloatTensor(np.array(next_states)).to(self.device)
+
+        # 1. Get Q-values for current states: Q(s, a)
+        current_q_values = self.policy_net(states).gather(1, actions)
+
+        # 2. Get expected Q-values from next states using the target network
+        # V(s') = max_a'(Q_target(s', a'))
+        with torch.no_grad():
+            next_q_values = self.target_net(next_states).max(1)[0].unsqueeze(1)
+        
+        # Bellman equation: E[Q] = r + gamma * V(s')
+        expected_q_values = rewards + (GAMMA_RL * next_q_values)
+
+        # 3. Compute loss (Smooth L1 Loss is often more stable than MSE)
+        loss = F.smooth_l1_loss(current_q_values, expected_q_values)
+
+        # 4. Optimize the model
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        return loss.item()
+
+    def update_target_net(self):
+        """Copies weights from the policy network to the target network."""
+        self.target_net.load_state_dict(self.policy_net.state_dict())
 
 
 class WorkingMemory:
-    """
-    VSA-based working memory for saccade-based object learning.
-    Binds DINO embeddings with coordinates and quaternions, bundles over time.
-    """
-
-    def __init__(self, dino_model, dino_transform, dino_device, ssp_dim=2500):
-        """
-        Initialize working memory with DINO model and SSP encoders.
-
-        Args:
-            dino_model: DINO model for image embeddings
-            dino_transform: Transform for DINO preprocessing
-            dino_device: Device for DINO inference
-            ssp_dim: Dimension of spatial semantic pointers
-        """
+    """VSA-based working memory for saccade-based object learning."""
+    def __init__(self, dino_model, dino_transform, dino_device, ssp_dim=SSP_DIM):
         self.dino_model = dino_model
         self.dino_transform = dino_transform
         self.dino_device = dino_device
         self.ssp_dim = ssp_dim
-
-        # Initialize SSP encoders
-        # Coordinate encoder (2D: x, y in pixel space)
         self.coord_encoder = sspspace.RandomSSPSpace(domain_dim=2, ssp_dim=ssp_dim)
-
-        # Quaternion encoder (4D: qw, qx, qy, qz)
         self.quat_encoder = sspspace.RandomSSPSpace(domain_dim=4, ssp_dim=ssp_dim)
-
-        # Initialize working memory (will be updated over time)
-        self.memory = self.coord_encoder.encode([[0, 0]])
+        self.memory = np.zeros((1, ssp_dim))
         self.saccade_count = 0
-
         print(f"  Working Memory initialized (SSP dim: {ssp_dim})")
 
     def bind(self, a, b):
-        """VSA binding using circular convolution (FFT)"""
         a = np.atleast_2d(a)
         b = np.atleast_2d(b)
         return np.fft.ifft(np.fft.fft(a, axis=1) * np.fft.fft(b, axis=1), axis=1).real
 
     def process_saccade(self, image_patch, saccade_center, rotation_state):
-        """
-        Process a saccade by binding image, coordinate, and rotation, then bundling into memory.
-
-        Args:
-            image_patch: numpy array of the image patch around saccade (ROI_SIZE x ROI_SIZE x 3)
-            saccade_center: tuple of (x, y) coordinates of saccade center
-            rotation_state: dict containing rotation information
-        """
-        # Extract DINO embeddings from image patch
         image_patch_rgb = cv2.cvtColor(image_patch, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(image_patch_rgb)
         input_tensor = self.dino_transform(pil_image).unsqueeze(0).to(self.dino_device)
-
         with torch.no_grad():
-            dino_embedding = self.dino_model(input_tensor)
-
-        # Convert to numpy and ensure proper shape
-        dino_embedding = dino_embedding.cpu().numpy()
-        if dino_embedding.shape[1] != self.ssp_dim:
-            # Pad or project DINO embedding to match SSP dimension
-            if dino_embedding.shape[1] < self.ssp_dim:
-                # Pad with zeros
-                padding = np.zeros((1, self.ssp_dim - dino_embedding.shape[1]))
-                dino_embedding = np.hstack([dino_embedding, padding])
-            else:
-                # Truncate (could also use a learned projection)
-                dino_embedding = dino_embedding[:, :self.ssp_dim]
-
-        # Encode coordinate as SSP
+            dino_embedding = self.dino_model(input_tensor).cpu().numpy()
+        if dino_embedding.shape[1] < self.ssp_dim:
+            padding = np.zeros((1, self.ssp_dim - dino_embedding.shape[1]))
+            dino_embedding = np.hstack([dino_embedding, padding])
+        else:
+            dino_embedding = dino_embedding[:, :self.ssp_dim]
         x, y = saccade_center
         coord_ssp = self.coord_encoder.encode([[x, y]])
-        coord_ssp = np.array(coord_ssp).squeeze()
-
-        # Encode quaternion as SSP
         quat = rotation_state['quaternion']
         quat_ssp = self.quat_encoder.encode([[quat[0], quat[1], quat[2], quat[3]]])
-        quat_ssp = np.array(quat_ssp).squeeze()
-
-        # Bind image with coordinate
         bound_img_coord = self.bind(dino_embedding, coord_ssp)
-
-        # Bind with quaternion
         bound_representation = self.bind(bound_img_coord, quat_ssp)
-
-        # Bundle into working memory with exponential decay
-        self.memory = GAMMA * self.memory + (1 - GAMMA) * bound_representation
+        self.memory = GAMMA_VSA * self.memory + (1 - GAMMA_VSA) * bound_representation
         self.saccade_count += 1
-
-        # Print debug info
-        print(f"\n=== VSA Saccade Processing ===")
-        print(f"Saccade #{self.saccade_count}")
-        print(f"Saccade center: ({x}, {y})")
-        print(f"Image patch shape: {image_patch.shape}")
-        print(f"DINO embedding shape: {dino_embedding.shape}, range: [{dino_embedding.min():.3f}, {dino_embedding.max():.3f}]")
-        print(f"Rotation - Yaw: {rotation_state['yaw']:.3f} rad, Pitch: {rotation_state['pitch']:.3f} rad")
-        print(f"Quaternion: [{quat[0]:.3f}, {quat[1]:.3f}, {quat[2]:.3f}, {quat[3]:.3f}]")
-        print(f"Memory shape: {self.memory.shape}, mean: {self.memory.mean():.5f}, std: {self.memory.std():.5f}")
-        print("=" * 40)
-
         return self.memory
 
     def get_memory(self):
-        """Return current working memory representation"""
-        return self.memory
+        return self.memory.flatten()
 
     def reset_memory(self):
-        """Reset working memory to initial state"""
-        self.memory = self.coord_encoder.encode([[0, 0]])
+        self.memory = np.zeros((1, self.ssp_dim))
         self.saccade_count = 0
         print("  Working memory reset")
 
 
 class EventFrameRenderer:
-    """Renders time surface from events"""
-
     def __init__(self, width, height, tau=40000):
-        self.width = width
-        self.height = height
-        self.tau = tau  # decay constant in us
+        self.width, self.height, self.tau = width, height, tau
         self.time = 0
         self.time_surface = np.zeros((height, width), dtype=np.uint64)
         self.pol_surface = np.zeros((height, width), dtype=np.uint8)
 
     def update(self, events, dt):
-        """Update time surface with new events and return rendered frame"""
-        # Update time surfaces
         if events.i > 0:
             self.time_surface[events.y[:events.i], events.x[:events.i]] = events.ts[:events.i]
             self.pol_surface[events.y[:events.i], events.x[:events.i]] = events.p[:events.i]
-
         self.time += dt
-
-        # Render time surface with exponential decay
         img = np.ones((self.height, self.width), dtype=np.float32) * 125
-
-        # Find pixels with recent events
         ind = np.where(self.time_surface > 0)
         if len(ind[0]) > 0:
-            # Calculate decay based on time since event
             decay = np.exp(-(self.time - self.time_surface[ind].astype(np.float32)) / self.tau)
-            # Polarity: 1 for ON (positive), 0 for OFF (negative)
-            # Map to: ON events = bright (positive), OFF events = dark (negative)
-            polarity_value = self.pol_surface[ind] * 2.0 - 1.0  # Maps 1->1, 0->-1
+            polarity_value = self.pol_surface[ind] * 2.0 - 1.0
             img[ind] = 125 + polarity_value * decay * 125
-
-        # Convert to uint8 and apply colormap
         img_uint8 = np.clip(img, 0, 255).astype(np.uint8)
-        img_color = cv2.applyColorMap(img_uint8, cv2.COLORMAP_VIRIDIS)
+        return cv2.applyColorMap(img_uint8, cv2.COLORMAP_VIRIDIS)
 
-        return img_color
-
-
-def render_rotating_object_with_events(xml_path, obj_name, enable_saccades=False):
+# --- RL: Modified main rendering function for RL integration ---
+def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='display'):
     """
-    Render object with real-time event conversion.
-    Shows both original view and event frame side-by-side.
-
-    Args:
-        xml_path: Path to MJCF file
-        obj_name: Name of object
-        enable_saccades: If True, run attention mechanism and show saccade location
-
-    Returns:
-        True if completed normally, False if user quit
+    Main simulation function, adapted for different modes.
+    Modes:
+    - 'display': Just shows the rotating object (original behavior).
+    - 'reference': Builds and returns a memory of a reference object.
+    - 'train': Runs the RL loop to train the agent.
     """
-    try:
-        # Load MuJoCo model
-        model = mujoco.MjModel.from_xml_path(xml_path)
-        data = mujoco.MjData(model)
+    model = mujoco.MjModel.from_xml_path(xml_path)
+    data = mujoco.MjData(model)
+    renderer = mujoco.Renderer(model, HEIGHT, WIDTH)
+    camera_id = -1
+    dvs = DvsSensor("RealTimeDVS")
+    dvs.initCamera(WIDTH, HEIGHT, lat=LAT, jit=JIT, ref=REF, tau=TAU, th_pos=TH_POS, th_neg=TH_NEG, th_noise=TH_NOISE, bgnp=BGNP, bgnn=BGNN)
+    
+    mujoco.mj_resetData(model, data)
+    mujoco.mj_forward(model, data)
+    renderer.update_scene(data)
+    first_frame = renderer.render()
+    first_luv = cv2.cvtColor(first_frame, cv2.COLOR_RGB2LUV)
+    first_lum = first_luv[:, :, 0] / 255.0 * 1e4
+    dvs.init_image(first_lum)
+    
+    event_renderer = EventFrameRenderer(WIDTH, HEIGHT, tau=3*DT)
+    
+    # Init attention network and DINO
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
+    net_attention = initialise_attention(device, ATTENTION_PARAMS)
+    transform = T.Compose([T.ToTensor()])
+    dino_device = torch.device("cpu") # DINO on CPU
+    dino_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14', verbose=False).to(dino_device)
+    dino_model.eval()
+    dino_transform = T.Compose([
+        T.Resize(224, interpolation=T.InterpolationMode.BICUBIC),
+        T.CenterCrop(224), T.ToTensor(),
+        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    
+    working_memory = WorkingMemory(dino_model, dino_transform, dino_device, ssp_dim=SSP_DIM)
+    
+    window_name = f"RL Discrimination: {obj_name} (Mode: {mode})"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, WIDTH * 2, HEIGHT)
 
-        # Create MuJoCo renderer
-        renderer = mujoco.Renderer(model, HEIGHT, WIDTH)
+    yaw_angle, pitch_angle = 0.0, 0.0
+    yaw_speed, pitch_speed = (INITIAL_YAW_SPEED, 0.0) if mode != 'train' else (0.0, 0.0)
+    
+    max_steps = 200 if mode == 'reference' else 2000 # Shorter for ref, longer for training
+    
+    for step in range(max_steps):
+        # --- RL: State, Action, Reward, Next State ---
+        current_state = None
+        saccade_target = None
+        top_k_coords_normalized = np.zeros(K_SALIENCY * 2)
 
-        # Set up camera
-        if CAMERA_NAME is None:
-            camera_id = -1
-        else:
-            try:
-                camera_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, CAMERA_NAME)
-            except:
-                print(f"  Warning: Camera '{CAMERA_NAME}' not found, using default")
-                camera_id = -1
-
-        # Initialize DVS sensor
-        print(f"  Initializing DVS sensor ({WIDTH}x{HEIGHT})...")
-        dvs = DvsSensor("RealTimeDVS")
-        dvs.initCamera(WIDTH, HEIGHT,
-                      lat=LAT, jit=JIT, ref=REF, tau=TAU,
-                      th_pos=TH_POS, th_neg=TH_NEG, th_noise=TH_NOISE,
-                      bgnp=BGNP, bgnn=BGNN)
-
-        # Render first frame to initialize DVS
+        # 1. GENERATE FRAME AND EVENTS
+        yaw_angle += yaw_speed
+        pitch_angle += pitch_speed
         mujoco.mj_resetData(model, data)
+        # Combine quaternions for ZYX rotation
+        cy, sy = np.cos(yaw_angle * 0.5), np.sin(yaw_angle * 0.5)
+        cp, sp = np.cos(pitch_angle * 0.5), np.sin(pitch_angle * 0.5)
+        data.qpos[3] = cy * cp  # qw
+        data.qpos[4] = 0        # qx
+        data.qpos[5] = cy * sp  # qy
+        data.qpos[6] = sy * cp  # qz
         mujoco.mj_forward(model, data)
-        if camera_id >= 0:
-            renderer.update_scene(data, camera=camera_id)
-        else:
-            renderer.update_scene(data)
-        first_frame = renderer.render()
+        renderer.update_scene(data)
+        pixels = renderer.render()
+        pixels_luv = cv2.cvtColor(pixels, cv2.COLOR_RGB2LUV)
+        luminance = pixels_luv[:, :, 0] / 255.0 * 1e4
+        events = dvs.update(luminance, DT)
+        event_frame = event_renderer.update(events, DT)
 
-        # Convert first frame to luminance and initialize DVS
-        first_frame_rgb = first_frame  # Already RGB from MuJoCo
-        first_luv = cv2.cvtColor(first_frame_rgb, cv2.COLOR_RGB2LUV)
-        first_lum = first_luv[:, :, 0] / 255.0 * 1e4  # Scale to 10 klux
-        dvs.init_image(first_lum)
+        # 2. RUN ATTENTION
+        saliency_map, salmax_coords = None, None
+        top_k_coords = []
+        if events.i > 0:
+            event_gray = cv2.cvtColor(event_frame, cv2.COLOR_BGR2GRAY)
+            event_tensor = transform(event_gray)
+            saliency_map, _ = run_attention(event_tensor, net_attention, device, (HEIGHT, WIDTH), ATTENTION_PARAMS['num_pyr'])
+            top_k_coords = get_top_k_saliency_coords(saliency_map, K_SALIENCY)
+            if top_k_coords:
+                salmax_coords = top_k_coords[0] # Default to top-1
 
-        # Initialize event frame renderer
-        event_renderer = EventFrameRenderer(WIDTH, HEIGHT, tau=3*DT)
+        # --- RL: Main Logic ---
+        if mode == 'train' and agent is not None:
+            # 3. CONSTRUCT STATE
+            current_mem = working_memory.get_memory()
+            if top_k_coords:
+                # Normalize coordinates to be between -1 and 1
+                coords_flat = np.array(top_k_coords, dtype=np.float32).flatten()
+                coords_flat[::2] = (coords_flat[::2] / HEIGHT) * 2 - 1 # Y
+                coords_flat[1::2] = (coords_flat[1::2] / WIDTH) * 2 - 1 # X
+                top_k_coords_normalized[:len(coords_flat)] = coords_flat
+            
+            current_state = np.concatenate([current_mem, top_k_coords_normalized])
+            sim_before = F.cosine_similarity(torch.Tensor(reference_memory), torch.Tensor(current_mem), dim=0).item()
 
-        # Initialize attention network and DINO if saccades enabled
-        net_attention = None
-        working_memory = None
-        device = None
-        transform = None
-        if enable_saccades:
-            print(f"  Initializing attention network for saccades...")
-            device = torch.device("mps" if torch.backends.mps.is_available()
-                                else "cuda" if torch.cuda.is_available() else "cpu")
-            print(f"    Using device for attention: {device}")
-            net_attention = initialise_attention(device, ATTENTION_PARAMS)
-            transform = T.Compose([
-                T.ToTensor(),
-            ])
-
-            # Initialize DINO model on CPU (MPS doesn't support bicubic interpolation)
-            print(f"  Initializing DINO model...")
-            dino_device = torch.device("cpu")
-            print(f"    Using device for DINO: {dino_device} (MPS doesn't support bicubic interpolation)")
-            dino_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
-            dino_model = dino_model.to(dino_device)
-            dino_model.eval()
-
-            # DINO preprocessing transform
-            dino_transform = T.Compose([
-                T.Resize(224, interpolation=T.InterpolationMode.BICUBIC),
-                T.CenterCrop(224),
-                T.ToTensor(),
-                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ])
-            print(f"    DINO model loaded")
-
-            # Initialize working memory
-            working_memory = WorkingMemory(dino_model, dino_transform, dino_device)
-            print(f"    Working memory initialized")
-
-        # Create display window
-        window_name = f"Real-time Events: {obj_name}"
-        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(window_name, WIDTH * 2, HEIGHT)
-
-        print(f"  Rendering {obj_name}...")
-        if enable_saccades:
-            print(f"  Saccades enabled - showing attention on event frames")
-        print(f"  Controls:")
-        print(f"    Left/Right arrows: Adjust yaw rotation speed")
-        print(f"    Up/Down arrows: Adjust pitch rotation speed")
-        print(f"    'q' or ESC: Exit")
-
-        # Initialize rotation state
-        yaw_angle = 0.0      # Rotation around Z-axis
-        pitch_angle = 0.0    # Rotation around Y-axis
-        yaw_speed = INITIAL_YAW_SPEED
-        pitch_speed = INITIAL_PITCH_SPEED
-        frame_count = 0
-
-        # Continuous rendering loop
-        while True:
-            # Update angles based on speeds
-            yaw_angle += yaw_speed
-            pitch_angle += pitch_speed
-
-            # Reset simulation
-            mujoco.mj_resetData(model, data)
-
-            # Compute quaternion from yaw and pitch (ZYX Euler angles)
-            # Quaternion for yaw (Z-axis rotation)
-            qz_w = np.cos(yaw_angle / 2)
-            qz_x = 0
-            qz_y = 0
-            qz_z = np.sin(yaw_angle / 2)
-
-            # Quaternion for pitch (Y-axis rotation)
-            qy_w = np.cos(pitch_angle / 2)
-            qy_x = 0
-            qy_y = np.sin(pitch_angle / 2)
-            qy_z = 0
-
-            # Combine quaternions: q_total = qz * qy
-            data.qpos[3] = qz_w * qy_w - qz_z * qy_y  # qw
-            data.qpos[4] = qz_w * qy_x + qz_z * qy_y  # qx
-            data.qpos[5] = qz_w * qy_y + qz_z * qy_w  # qy
-            data.qpos[6] = qz_w * qy_z + qz_z * qy_w  # qz
-
-            # Step the simulation
-            mujoco.mj_forward(model, data)
-
-            # Render the scene
-            if camera_id >= 0:
-                renderer.update_scene(data, camera=camera_id)
+            # 4. CHOOSE AND EXECUTE ACTION
+            action_idx = agent.choose_action(current_state)
+            if action_idx < NUM_MOVE_ACTIONS:
+                # It's a move action
+                if action_idx == 0: yaw_speed += SPEED_INCREMENT
+                elif action_idx == 1: yaw_speed -= SPEED_INCREMENT
+                elif action_idx == 2: pitch_speed += SPEED_INCREMENT
+                elif action_idx == 3: pitch_speed -= SPEED_INCREMENT
+                # action_idx == 4 is do_nothing
+                saccade_target = salmax_coords # Default saccade
             else:
-                renderer.update_scene(data)
-            pixels = renderer.render()
+                # It's a saccade action
+                saccade_idx = action_idx - NUM_MOVE_ACTIONS
+                if top_k_coords and saccade_idx < len(top_k_coords):
+                    saccade_target = top_k_coords[saccade_idx]
+                else:
+                    saccade_target = salmax_coords # Fallback
+        else: # For 'reference' or 'display' mode
+            saccade_target = salmax_coords
 
-            # Convert to luminance for DVS
-            pixels_luv = cv2.cvtColor(pixels, cv2.COLOR_RGB2LUV)
-            luminance = pixels_luv[:, :, 0] / 255.0 * 1e4
+        # 5. PROCESS SACCADE AND GET NEXT STATE
+        roi_coords = None
+        if saccade_target:
+            y, x = saccade_target[0], saccade_target[1]
+            x1, y1 = max(x - (ROI_SIZE // 2), 0), max(y - (ROI_SIZE // 2), 0)
+            x2, y2 = min(x1 + ROI_SIZE, WIDTH), min(y1 + ROI_SIZE, HEIGHT)
+            roi_coords = (x1, y1, x2, y2)
+            image_patch = event_frame[y1:y2, x1:x2]
+            if image_patch.shape[0] > 0 and image_patch.shape[1] > 0:
+                rotation_state = {'quaternion': (data.qpos[3], data.qpos[4], data.qpos[5], data.qpos[6])}
+                working_memory.process_saccade(image_patch, (x, y), rotation_state)
 
-            # Generate events
-            events = dvs.update(luminance, DT)
+        if mode == 'train' and agent is not None and current_state is not None:
+            # 6. CALCULATE REWARD & STORE EXPERIENCE
+            next_mem = working_memory.get_memory()
+            sim_after = F.cosine_similarity(torch.Tensor(reference_memory), torch.Tensor(next_mem), dim=0).item()
+            reward = sim_before - sim_after # Reward for *reducing* similarity
 
-            # Render event frame
-            event_frame = event_renderer.update(events, DT)
+            next_state = np.concatenate([next_mem, top_k_coords_normalized]) # Saliency map is from current step
+            agent.remember(current_state, action_idx, reward, next_state)
+            
+            # 7. TRAIN AGENT
+            loss = agent.replay()
+            if step % TARGET_UPDATE_FREQ == 0:
+                agent.update_target_net()
+                if loss is not None:
+                    print(f"Step {step}/{max_steps} | Loss: {loss:.4f} | Reward: {reward:.4f} | Epsilon: {agent.steps_done}")
 
-            # Run attention mechanism on event frame if enabled
-            saccade_x, saccade_y = None, None
-            if enable_saccades and events.i > 0:
-                # Convert event frame to grayscale for attention
-                event_gray = cv2.cvtColor(event_frame, cv2.COLOR_BGR2GRAY)
 
-                # Convert to tensor (don't add batch dimension - run_attention creates its own batching)
-                event_tensor = transform(event_gray)
+        # 6. VISUALIZE
+        display_original = cv2.cvtColor(pixels, cv2.COLOR_RGB2BGR)
+        event_frame_display = event_frame.copy()
+        if saccade_target:
+             cv2.drawMarker(event_frame_display, (saccade_target[1], saccade_target[0]), (0, 255, 0), cv2.MARKER_CROSS, 20, 2)
+        if roi_coords:
+             cv2.rectangle(display_original, (roi_coords[0], roi_coords[1]), (roi_coords[2], roi_coords[3]), (0, 255, 0), 2)
+        combined = np.hstack([display_original, event_frame_display])
+        cv2.putText(combined, f"Mode: {mode}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.imshow(window_name, combined)
+        if cv2.waitKey(1) & 0xFF == ord('q'): break
 
-                # Run attention
-                saliency_map, salmax_coords = run_attention(
-                    event_tensor, net_attention, device,
-                    (HEIGHT, WIDTH), ATTENTION_PARAMS['num_pyr']
-                )
-
-                # Extract coordinates
-                saccade_y, saccade_x = salmax_coords[0], salmax_coords[1]
-
-            # Convert original frame to BGR for display
-            display_original = cv2.cvtColor(pixels, cv2.COLOR_RGB2BGR)
-
-            # Create copy of event frame for overlay
-            event_frame_display = event_frame.copy()
-
-            # Overlay saccade location on both frames if enabled
-            if enable_saccades and saccade_x is not None:
-                # Calculate bounding box
-                x1 = max(saccade_x - (ROI_SIZE // 2), 0)
-                y1 = max(saccade_y - (ROI_SIZE // 2), 0)
-                x2 = min(x1 + ROI_SIZE, WIDTH)
-                y2 = min(y1 + ROI_SIZE, HEIGHT)
-
-                # Adjust if box extends beyond boundaries
-                if x2 - x1 < ROI_SIZE and x1 > 0:
-                    x1 = max(x2 - ROI_SIZE, 0)
-                if y2 - y1 < ROI_SIZE and y1 > 0:
-                    y1 = max(y2 - ROI_SIZE, 0)
-
-                # Extract image patch from event frame
-                image_patch = event_frame[y1:y2, x1:x2]
-
-                # Prepare rotation state
-                rotation_state = {
-                    'yaw': yaw_angle,
-                    'pitch': pitch_angle,
-                    'quaternion': (data.qpos[3], data.qpos[4], data.qpos[5], data.qpos[6])
-                }
-
-                # Process with VSA working memory
-                working_memory.process_saccade(image_patch, (saccade_x, saccade_y), rotation_state)
-
-                # Draw on EVENT frame
-                # Draw crosshair at saccade location
-                cv2.drawMarker(event_frame_display, (saccade_x, saccade_y),
-                             (0, 255, 0), cv2.MARKER_CROSS, 20, 2)
-                # Draw bounding box
-                cv2.rectangle(event_frame_display, (x1, y1), (x2, y2),
-                            (0, 255, 0), 2)
-
-                # Draw on ORIGINAL frame
-                # Draw crosshair at saccade location
-                cv2.drawMarker(display_original, (saccade_x, saccade_y),
-                             (0, 255, 0), cv2.MARKER_CROSS, 20, 2)
-                # Draw bounding box
-                cv2.rectangle(display_original, (x1, y1), (x2, y2),
-                            (0, 255, 0), 2)
-
-            # Combine original and event frame side-by-side
-            combined = np.hstack([display_original, event_frame_display])
-
-            # Add labels
-            cv2.putText(combined, "Original", (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-            label = "Events + Saccades" if enable_saccades else "Events"
-            cv2.putText(combined, label, (WIDTH + 10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-
-            # Show rotation speeds
-            speed_info = f"Yaw: {yaw_speed:.3f} | Pitch: {pitch_speed:.3f} rad/frame"
-            cv2.putText(combined, speed_info, (10, HEIGHT - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-            # Show event info
-            event_info = f"{events.i} events"
-            if enable_saccades and saccade_x is not None:
-                event_info += f" | Saccade: ({saccade_x},{saccade_y})"
-            cv2.putText(combined, event_info, (WIDTH + 10, HEIGHT - 10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-            # Display
-            cv2.imshow(window_name, combined)
-
-            # Check for keyboard input
-            key = cv2.waitKey(30)
-            if key == 27 or key == ord('q') or key == ord('Q'):
-                print(f"  Stopped by user")
-                cv2.destroyWindow(window_name)
-                renderer.close()
-                return False
-            elif key != -1:
-                # macOS arrow key codes: Left=2, Right=3, Up=0, Down=1
-                if key == 2 or key == 81:  # Left arrow
-                    yaw_speed -= SPEED_INCREMENT
-                    print(f"  Yaw speed: {yaw_speed:.3f} rad/frame")
-                elif key == 3 or key == 83:  # Right arrow
-                    yaw_speed += SPEED_INCREMENT
-                    print(f"  Yaw speed: {yaw_speed:.3f} rad/frame")
-                elif key == 0 or key == 82:  # Up arrow
-                    pitch_speed += SPEED_INCREMENT
-                    print(f"  Pitch speed: {pitch_speed:.3f} rad/frame")
-                elif key == 1 or key == 84:  # Down arrow
-                    pitch_speed -= SPEED_INCREMENT
-                    print(f"  Pitch speed: {pitch_speed:.3f} rad/frame")
-
-            frame_count += 1
-
-        # Close display window and renderer
-        cv2.destroyWindow(window_name)
-        renderer.close()
-
-        return True
-
-    except Exception as e:
-        print(f"  ✗ Error rendering {obj_name}: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+    cv2.destroyWindow(window_name)
+    renderer.close()
+    
+    if mode == 'reference':
+        return working_memory.get_memory()
+    return None
 
 
 def main():
-    """Render objects with real-time event conversion."""
-
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description='Render rotating 3D objects with real-time event conversion')
-    parser.add_argument('--object', type=str, default=None,
-                        help='Render only a specific object by name (default: dog)')
-    parser.add_argument('--saccades', action='store_true',
-                        help='Enable saccade detection using attention mechanism')
+    parser = argparse.ArgumentParser(description='Run RL agent for object discrimination.')
+    parser.add_argument('--ref', type=str, default='dog', help='Name of the reference object.')
+    parser.add_argument('--targets', type=str, nargs='+', default=None, help='Names of target objects to discriminate (space-separated). If not provided, uses all objects except reference.')
+    parser.add_argument('--num_episodes', type=int, default=10, help='Number of training episodes (each episode randomly selects a target object).')
     args = parser.parse_args()
 
-    # Default to dog if no object specified
-    obj_name = args.object if args.object else "dog"
+    # --- RL: Define state and action dimensions ---
+    state_dim = SSP_DIM + (K_SALIENCY * 2) # Memory vector + K coordinates (y,x)
 
-    # Find XML file
-    obj_dir = os.path.join(OBJECTS_DIR, obj_name)
-    xml_path = os.path.join(obj_dir, f"{obj_name}.xml")
+    # --- RL: Instantiate the agent ---
+    agent = DiscriminationAgent(state_dim, TOTAL_ACTIONS)
 
-    if not os.path.exists(xml_path):
-        print(f"Error: Object '{obj_name}' not found at {xml_path}")
-        return
+    # --- PHASE 1: Build reference memory ---
+    print("\n" + "="*80)
+    print(f"PHASE 1: Building reference memory for '{args.ref}'...")
+    ref_xml_path = os.path.join(OBJECTS_DIR, args.ref, f"{args.ref}.xml")
+    if not os.path.exists(ref_xml_path):
+        print(f"Error: Reference object '{args.ref}' not found."); return
 
-    print(f"Rendering object: {obj_name}")
-    print(f"Settings: {WIDTH}x{HEIGHT}, continuous rotation")
-    print(f"DVS parameters: th_pos={TH_POS}, th_neg={TH_NEG}, tau={TAU}us")
-    if args.saccades:
-        print(f"Saccades: ENABLED (ROI size: {ROI_SIZE}x{ROI_SIZE})")
-    print("=" * 80)
+    reference_memory = run_simulation(ref_xml_path, args.ref, mode='reference')
+    print(f"✓ Reference memory for '{args.ref}' created.")
+    print("="*80 + "\n")
 
-    # Render the object
-    result = render_rotating_object_with_events(xml_path, obj_name, enable_saccades=args.saccades)
-
-    cv2.destroyAllWindows()
-
-    if result:
-        print("\n✓ Rendering complete!")
+    # --- Discover or validate target objects ---
+    if args.targets is None:
+        # Auto-discover all objects except reference
+        all_objects = [d for d in os.listdir(OBJECTS_DIR) if os.path.isdir(os.path.join(OBJECTS_DIR, d)) and d != args.ref]
+        targets = all_objects
+        print(f"Auto-discovered {len(targets)} target objects: {targets}")
     else:
-        print("\n⊘ Rendering stopped")
+        targets = args.targets
+        print(f"Using specified target objects: {targets}")
+
+    # Validate all target objects exist
+    target_xml_paths = {}
+    for obj in targets:
+        xml_path = os.path.join(OBJECTS_DIR, obj, f"{obj}.xml")
+        if not os.path.exists(xml_path):
+            print(f"Warning: Target object '{obj}' not found, skipping.")
+        else:
+            target_xml_paths[obj] = xml_path
+
+    if not target_xml_paths:
+        print("Error: No valid target objects found."); return
+
+    print(f"Training on {len(target_xml_paths)} objects: {list(target_xml_paths.keys())}")
+    print("="*80 + "\n")
+
+    # --- PHASE 2: Train agent on multiple target objects ---
+    print("="*80)
+    print(f"PHASE 2: Training agent for {args.num_episodes} episodes...")
+    print(f"Each episode randomly selects from: {list(target_xml_paths.keys())}")
+    print("="*80 + "\n")
+
+    for episode in range(args.num_episodes):
+        # Randomly select a target object for this episode
+        target_obj = random.choice(list(target_xml_paths.keys()))
+        target_xml_path = target_xml_paths[target_obj]
+
+        print(f"\n--- Episode {episode + 1}/{args.num_episodes}: Training on '{target_obj}' ---")
+        run_simulation(target_xml_path, target_obj, agent=agent, reference_memory=reference_memory, mode='train')
+        print(f"✓ Episode {episode + 1} complete!")
+
+    print("\n" + "="*80)
+    print("✓ All training complete!")
+    print("="*80)
 
 
 if __name__ == "__main__":
     main()
+
