@@ -72,7 +72,7 @@ K_SALIENCY = 5              # Agent can choose from top K salient points
 NUM_MOVE_ACTIONS = 5        # inc/dec yaw, inc/dec pitch, do_nothing
 NUM_SACCADE_ACTIONS = K_SALIENCY
 TOTAL_ACTIONS = NUM_MOVE_ACTIONS + NUM_SACCADE_ACTIONS
-SSP_DIM = 1000              # Must match WorkingMemory ssp_dim
+SSP_DIM = 384              # the same as small DINOv2 embedding size
 
 # RL Hyperparameters
 REPLAY_BUFFER_SIZE = 5000
@@ -82,6 +82,9 @@ EPSILON_START = 0.9
 EPSILON_END = 0.05
 EPSILON_DECAY = 1000
 TARGET_UPDATE_FREQ = 10     # Update target network every 10 episodes/steps
+MAX_REF_STEPS = 200         # Shorter for reference/inference
+# TODO: use more ref steps (e.g. 2000) if it works and we can run it on a GPU
+MAX_TRAIN_STEPS = 500       # Longer for training
 
 def enforce_minimum_speed(yaw_speed, pitch_speed, min_speed=MIN_SPEED):
     """
@@ -259,18 +262,27 @@ class WorkingMemory:
         pil_image = Image.fromarray(image_patch_rgb)
         input_tensor = self.dino_transform(pil_image).unsqueeze(0).to(self.dino_device)
         with torch.no_grad():
+            # DINO embedding (small model) is 1x384
             dino_embedding = self.dino_model(input_tensor).cpu().numpy()
+        
         if dino_embedding.shape[1] < self.ssp_dim:
             padding = np.zeros((1, self.ssp_dim - dino_embedding.shape[1]))
             dino_embedding = np.hstack([dino_embedding, padding])
         else:
             dino_embedding = dino_embedding[:, :self.ssp_dim]
+
+        # normalize dino embedding so its norm is 1
+        dino_embedding /= np.linalg.norm(dino_embedding) + 1e-10
+        
         x, y = saccade_center
         coord_ssp = self.coord_encoder.encode([[x, y]])
         quat = rotation_state['quaternion']
         quat_ssp = self.quat_encoder.encode([[quat[0], quat[1], quat[2], quat[3]]])
+        # TODO: is this the correct way to bind 3 things?
         bound_img_coord = self.bind(dino_embedding, coord_ssp)
         bound_representation = self.bind(bound_img_coord, quat_ssp)
+        # TODO: can we do something more sophisticated than simple exponential moving average?
+        #       sparse 3D representation by storing the different (protypical) views separately?
         self.memory = GAMMA_VSA * self.memory + (1 - GAMMA_VSA) * bound_representation
         self.saccade_count += 1
         return self.memory
@@ -367,8 +379,7 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
     # Enforce minimum speed from the start
     yaw_speed, pitch_speed = enforce_minimum_speed(yaw_speed, pitch_speed)
 
-    # TODO: use more ref steps (e.g. 2000) if it works and we can run it on a GPU
-    max_steps = 200 if mode in ['reference', 'inference'] else 200 # Shorter for ref, longer for training
+    max_steps = MAX_REF_STEPS if mode in ['reference', 'inference'] else MAX_TRAIN_STEPS
     if mode == 'demo':
         max_steps = 100000  # Run indefinitely until user quits
 
@@ -481,6 +492,8 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
             x1, y1 = max(x - (ROI_SIZE // 2), 0), max(y - (ROI_SIZE // 2), 0)
             x2, y2 = min(x1 + ROI_SIZE, WIDTH), min(y1 + ROI_SIZE, HEIGHT)
             roi_coords = (x1, y1, x2, y2)
+            # TODO: do we want to incorporate the periphery
+            #       maybe downsample the region outside the ROI?
             image_patch = event_frame[y1:y2, x1:x2]
             if image_patch.shape[0] > 0 and image_patch.shape[1] > 0:
                 rotation_state = {'quaternion': (data.qpos[3], data.qpos[4], data.qpos[5], data.qpos[6])}
@@ -563,21 +576,22 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
             break
         elif mode == 'demo' and key != -1:
             # Arrow keys for adjusting rotation speeds
-            # Arrow key codes: Up=2490368, Down=2621440, Left=2424832, Right=2555904 (common values)
-            # Also handle: Up=82/0, Down=84/1, Left=81/2, Right=83/3 (alternative codes)
-            if key == 2490368 or key == 82 or key == 0:  # Up arrow
+            # macOS: Up=63232, Down=63233, Left=63234, Right=63235
+            # Linux/Windows: Up=2490368, Down=2621440, Left=2424832, Right=2555904
+            # Alternative: Up=82/0, Down=84/1, Left=81/2, Right=83/3
+            if key == 63232 or key == 2490368 or key == 82 or key == 0:  # Up arrow
                 pitch_speed += SPEED_INCREMENT
                 yaw_speed, pitch_speed = enforce_minimum_speed(yaw_speed, pitch_speed)
                 print(f"Pitch speed increased to {pitch_speed:.3f}")
-            elif key == 2621440 or key == 84 or key == 1:  # Down arrow
+            elif key == 63233 or key == 2621440 or key == 84 or key == 1:  # Down arrow
                 pitch_speed -= SPEED_INCREMENT
                 yaw_speed, pitch_speed = enforce_minimum_speed(yaw_speed, pitch_speed)
                 print(f"Pitch speed decreased to {pitch_speed:.3f}")
-            elif key == 2424832 or key == 81 or key == 2:  # Left arrow
+            elif key == 63234 or key == 2424832 or key == 81 or key == 2:  # Left arrow
                 yaw_speed -= SPEED_INCREMENT
                 yaw_speed, pitch_speed = enforce_minimum_speed(yaw_speed, pitch_speed)
                 print(f"Yaw speed decreased to {yaw_speed:.3f}")
-            elif key == 2555904 or key == 83 or key == 3:  # Right arrow
+            elif key == 63235 or key == 2555904 or key == 83 or key == 3:  # Right arrow
                 yaw_speed += SPEED_INCREMENT
                 yaw_speed, pitch_speed = enforce_minimum_speed(yaw_speed, pitch_speed)
                 print(f"Yaw speed increased to {yaw_speed:.3f}")
@@ -805,19 +819,22 @@ def main():
 
     elif args.mode == 'demo':
         # --- DEMO MODE: Manual control of object rotation ---
+        # Use first object from --objects if provided, otherwise use --demo_obj
+        demo_obj = args.objects[0] if args.objects else args.demo_obj
+
         print("\n" + "="*80)
-        print(f"DEMO MODE: Viewing '{args.demo_obj}'")
+        print(f"DEMO MODE: Viewing '{demo_obj}'")
         print("="*80)
         print("Controls:")
         print("  Arrow Keys: Adjust yaw (left/right) and pitch (up/down) speeds")
         print("  Q: Quit")
         print("="*80 + "\n")
 
-        demo_xml_path = os.path.join(OBJECTS_DIR, args.demo_obj, f"{args.demo_obj}.xml")
+        demo_xml_path = os.path.join(OBJECTS_DIR, demo_obj, f"{demo_obj}.xml")
         if not os.path.exists(demo_xml_path):
-            print(f"Error: Demo object '{args.demo_obj}' not found."); return
+            print(f"Error: Demo object '{demo_obj}' not found."); return
 
-        run_simulation(demo_xml_path, args.demo_obj, mode='demo')
+        run_simulation(demo_xml_path, demo_obj, mode='demo')
 
         print("\n" + "="*80)
         print("✓ Demo complete!")
