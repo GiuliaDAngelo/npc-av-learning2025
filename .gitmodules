@@ -1,0 +1,3 @@
+[submodule "IEBCS"]
+	path = IEBCS
+	url = https://github.com/neuromorphicsystems/IEBCS.git
