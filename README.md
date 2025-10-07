@@ -14,6 +14,7 @@ pip install torch torchvision matplotlib numpy scikit-learn
 pip install opencv-python
 pip install umap-learn # Optional, for UMAP analysis
 pip install mujoco
+pip install scikit-image
 ```
 
 2. Download CRIB Data and unzip it to `./CRIB Data/`
