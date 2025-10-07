@@ -7,12 +7,13 @@ Object learning through saccades using contrastive deep Q-learning.
 ```bash
 git clone git@github.com:ctn-waterloo/sspspace.git
 cd sspspace
-pip install sspspace
+pip install . # to install sspspace
 
 # use pip or conda to install
 pip install torch torchvision matplotlib numpy scikit-learn
 pip install opencv-python
 pip install umap-learn # Optional, for UMAP analysis
+pip install mujoco
 ```
 
 2. Download CRIB Data and unzip it to `./CRIB Data/`
