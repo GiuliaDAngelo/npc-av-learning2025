@@ -31,3 +31,4 @@ Non-orthogonality of DINO embeddings can affect working memory performance by in
 increased interference compared to random SSP vectors.
 
 Binding the DINO patches with SSP positions should orthogonalize the vectors: cos similarity $\rightarrow 0$. Unless we need to unbind (DINO-patch, SSP-position, SSP-rotation) precisely, it should be ok.  
+**SSP-DINO compatibility explored here:** [ssp-dino_compatibility.ipynb](https://github.com/GiuliaDAngelo/npc-av-learning2025/blob/main/notes/ssp-dino_compatibility.ipynb)
