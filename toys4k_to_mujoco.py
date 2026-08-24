@@ -26,8 +26,14 @@ OUT = os.path.expanduser('~/DATA/Toys4k/mujoco_objects')
 def blend_to_glb(blend, glb):
     expr = (f"import bpy; bpy.ops.export_scene.gltf(filepath={glb!r}, "
             f"export_format='GLB')")
-    r = subprocess.run(['blender', '-b', blend, '--python-expr', expr],
-                       capture_output=True, text=True, timeout=180)
+    # Distro blender runs on system python, which has no numpy (the glTF
+    # exporter needs it); borrow the venv's via PYTHONPATH.
+    venv_sp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           '.venv', 'lib', 'python3.14', 'site-packages')
+    env = {**os.environ, 'PYTHONPATH': venv_sp}
+    r = subprocess.run(['blender', '-b', blend, '--python-use-system-env',
+                        '--python-expr', expr],
+                       capture_output=True, text=True, timeout=180, env=env)
     if not os.path.exists(glb):
         raise RuntimeError((r.stdout + r.stderr)[-200:])
 
