@@ -99,7 +99,11 @@ def zero_2pi_tan(x, y):
     return angle
 
 
+@torch.no_grad()
 def run_attention(window, net, device, resolution, num_pyr):
+    # Inference only: without no_grad the stateful LIF layer chains an autograd
+    # graph across every timestep, so GPU memory grows without bound.
+    window = window.to(device)  # resize on the accelerator rather than the CPU
     # Create resized versions of the frames
     resized_frames = [torchvision.transforms.Resize((int(resolution[0] / num_pyr), int(resolution[1] / num_pyr)))(
         window) for pyr in range(1, num_pyr + 1)]
@@ -107,13 +111,13 @@ def run_attention(window, net, device, resolution, num_pyr):
     # Process frames in batches
     batch_frames = torch.stack(
         [torchvision.transforms.Resize((resolution[0], resolution[1]))(window) for window in resized_frames]).type(torch.float32)
-    batch_frames = batch_frames.to(device)  # Move to GPU if available
     output_rot = net(batch_frames)
-    # Sum the outputs over rotations and scales
-    output_rot_sum = torch.sum(torch.sum(output_rot, dim=1, keepdim=True), dim=0, keepdim=True).type(torch.float32).cpu().detach()
+    # Sum the outputs over rotations and scales (kept on the accelerator; only the
+    # final saliency map is downloaded)
+    output_rot_sum = torch.sum(torch.sum(output_rot, dim=1, keepdim=True), dim=0, keepdim=True).type(torch.float32)
     salmap = torchvision.transforms.Resize((resolution[0], resolution[1]))(output_rot_sum).squeeze(0).squeeze(
         0)
-    salmax_coords = np.unravel_index(torch.argmax(salmap).cpu().numpy(), salmap.shape)
+    salmax_coords = np.unravel_index(int(torch.argmax(salmap)), salmap.shape)
     # normalise salmap for visualization
     salmap = salmap.detach().cpu().numpy()
     salmap = np.array((salmap - salmap.min()) / (salmap.max() - salmap.min()) * 255)

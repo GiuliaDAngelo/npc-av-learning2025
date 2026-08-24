@@ -28,10 +28,12 @@ from datetime import datetime
 # Add IEBCS to path
 sys.path.append("IEBCS/src")
 from dvs_sensor import DvsSensor
+from dvs_sensor_torch import TorchDvsSensor
 from event_buffer import EventBuffer
 
 # Import attention mechanism
 from attention_helpers import initialise_attention, run_attention
+from itti_saliency import IttiKochSaliency
 
 # Configuration
 OBJECTS_DIR = "CRIB Data/mujoco_objects"
@@ -39,7 +41,10 @@ WIDTH = 640
 HEIGHT = 480
 CAMERA_NAME = None  # Use default camera
 
-# Rotation control parameters
+# Rotation control parameters (module-level so episode recorders can randomize
+# the starting pose/trajectory for exploration diversity)
+INITIAL_YAW_ANGLE = 0.0
+INITIAL_PITCH_ANGLE = 0.0
 INITIAL_YAW_SPEED = 0.05
 INITIAL_PITCH_SPEED = 0.0
 SPEED_INCREMENT = 0.01
@@ -66,6 +71,18 @@ ATTENTION_PARAMS = {
 }
 ROI_SIZE = 100
 GAMMA_VSA = 0.99  # VSA Memory update factor
+
+# What the encoder sees at each fixation ('rgb' or 'events') and what drives the
+# saliency map ('events': spiking VM attention on event frames, 'rgb': the same
+# attention on the RGB grayscale, 'itti': Itti-Koch-Niebur on the RGB render).
+# Defaults: encode appearance from the RGB render, use events only to find where
+# to look. Overridable via --patch_source/--saliency_source.
+PATCH_SOURCE = 'rgb'
+SALIENCY_SOURCE = 'itti'
+# When True, WorkingMemory keeps a raw per-saccade log (patch, coords, quaternion,
+# embedding); run_simulation exposes the last episode's log as LAST_SACCADE_LOG.
+RECORD_SACCADES = False
+LAST_SACCADE_LOG = None
 
 # --- RL: New constants for the Deep Q-Learning Agent ---
 K_SALIENCY = 5              # Agent can choose from top K salient points
@@ -250,6 +267,8 @@ class WorkingMemory:
         self.quat_encoder = sspspace.RandomSSPSpace(domain_dim=4, ssp_dim=ssp_dim)
         self.memory = np.zeros((1, ssp_dim))
         self.saccade_count = 0
+        self.record = False
+        self.saccade_log = []
         print(f"  Working Memory initialized (SSP dim: {ssp_dim})")
 
     def bind(self, a, b):
@@ -264,7 +283,15 @@ class WorkingMemory:
         with torch.no_grad():
             # DINO embedding (small model) is 1x384
             dino_embedding = self.dino_model(input_tensor).cpu().numpy()
-        
+
+        if self.record:
+            self.saccade_log.append({
+                'patch': image_patch.copy(),          # BGR uint8, as cropped
+                'coord': tuple(saccade_center),
+                'quat': tuple(rotation_state['quaternion']),
+                'embedding': dino_embedding.flatten().copy(),  # raw encoder output
+            })
+
         if dino_embedding.shape[1] < self.ssp_dim:
             padding = np.zeros((1, self.ssp_dim - dino_embedding.shape[1]))
             dino_embedding = np.hstack([dino_embedding, padding])
@@ -338,7 +365,7 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
     data = mujoco.MjData(model)
     renderer = mujoco.Renderer(model, HEIGHT, WIDTH)
     camera_id = -1
-    dvs = DvsSensor("RealTimeDVS")
+    dvs = TorchDvsSensor("RealTimeDVS")  # GPU port of the IEBCS sensor (see dvs_sensor_torch.py)
     dvs.initCamera(WIDTH, HEIGHT, lat=LAT, jit=JIT, ref=REF, tau=TAU, th_pos=TH_POS, th_neg=TH_NEG, th_noise=TH_NOISE, bgnp=BGNP, bgnn=BGNN)
     
     mujoco.mj_resetData(model, data)
@@ -354,8 +381,9 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
     # Init attention network and DINO
     device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
     net_attention = initialise_attention(device, ATTENTION_PARAMS)
+    itti_model = IttiKochSaliency(device) if SALIENCY_SOURCE == 'itti' else None
     transform = T.Compose([T.ToTensor()])
-    dino_device = torch.device("cpu") # DINO on CPU
+    dino_device = device # DINO on the same accelerator as the attention net
     dino_model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14', verbose=False).to(dino_device)
     dino_model.eval()
     dino_transform = T.Compose([
@@ -365,16 +393,14 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
     ])
     
     working_memory = WorkingMemory(dino_model, dino_transform, dino_device, ssp_dim=SSP_DIM)
+    working_memory.record = RECORD_SACCADES
     
     window_name = f"RL Discrimination: {obj_name} (Mode: {mode})"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, WIDTH * 2, HEIGHT)
 
-    yaw_angle, pitch_angle = 0.0, 0.0
-    if mode not in ['train', 'inference']:
-        yaw_speed, pitch_speed = INITIAL_YAW_SPEED, 0.0
-    else:
-        yaw_speed, pitch_speed = INITIAL_YAW_SPEED, 0.0  # Start with minimum movement
+    yaw_angle, pitch_angle = INITIAL_YAW_ANGLE, INITIAL_PITCH_ANGLE
+    yaw_speed, pitch_speed = INITIAL_YAW_SPEED, INITIAL_PITCH_SPEED
 
     # Enforce minimum speed from the start
     yaw_speed, pitch_speed = enforce_minimum_speed(yaw_speed, pitch_speed)
@@ -408,13 +434,19 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
         events = dvs.update(luminance, DT)
         event_frame = event_renderer.update(events, DT)
 
-        # 2. RUN ATTENTION
+        # 2. RUN ATTENTION (RGB-based saliency does not depend on event activity)
         saliency_map, salmax_coords = None, None
         top_k_coords = []
-        if events.i > 0:
-            event_gray = cv2.cvtColor(event_frame, cv2.COLOR_BGR2GRAY)
-            event_tensor = transform(event_gray)
-            saliency_map, _ = run_attention(event_tensor, net_attention, device, (HEIGHT, WIDTH), ATTENTION_PARAMS['num_pyr'])
+        if events.i > 0 or SALIENCY_SOURCE in ('rgb', 'itti'):
+            if SALIENCY_SOURCE == 'itti':
+                saliency_map = itti_model.compute(pixels)
+            else:
+                if SALIENCY_SOURCE == 'rgb':
+                    attn_gray = cv2.cvtColor(pixels, cv2.COLOR_RGB2GRAY)
+                else:
+                    attn_gray = cv2.cvtColor(event_frame, cv2.COLOR_BGR2GRAY)
+                event_tensor = transform(attn_gray)
+                saliency_map, _ = run_attention(event_tensor, net_attention, device, (HEIGHT, WIDTH), ATTENTION_PARAMS['num_pyr'])
             top_k_coords = get_top_k_saliency_coords(saliency_map, K_SALIENCY)
             if top_k_coords:
                 salmax_coords = top_k_coords[0] # Default to top-1
@@ -494,7 +526,12 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
             roi_coords = (x1, y1, x2, y2)
             # TODO: do we want to incorporate the periphery
             #       maybe downsample the region outside the ROI?
-            image_patch = event_frame[y1:y2, x1:x2]
+            if PATCH_SOURCE == 'rgb':
+                # Encode appearance from the RGB render; events only guided the saccade.
+                # (BGR, so process_saccade's BGR->RGB conversion stays correct.)
+                image_patch = cv2.cvtColor(pixels[y1:y2, x1:x2], cv2.COLOR_RGB2BGR)
+            else:
+                image_patch = event_frame[y1:y2, x1:x2]
             if image_patch.shape[0] > 0 and image_patch.shape[1] > 0:
                 rotation_state = {'quaternion': (data.qpos[3], data.qpos[4], data.qpos[5], data.qpos[6])}
                 working_memory.process_saccade(image_patch, (x, y), rotation_state)
@@ -599,6 +636,9 @@ def run_simulation(xml_path, obj_name, agent=None, reference_memory=None, mode='
     cv2.destroyWindow(window_name)
     renderer.close()
 
+    global LAST_SACCADE_LOG
+    LAST_SACCADE_LOG = working_memory.saccade_log
+
     if mode in ['reference', 'inference']:
         return working_memory.get_memory()
     return None
@@ -642,7 +682,16 @@ def main():
     parser.add_argument('--agent_path', type=str, default='agent.pt', help='Path to save/load agent weights.')
     parser.add_argument('--memory_dir', type=str, default='memories', help='Directory to save memories.')
     parser.add_argument('--demo_obj', type=str, default='dog', help='Object to display in demo mode.')
+    parser.add_argument('--patch_source', type=str, default='rgb', choices=['rgb', 'events'],
+                        help='Image source for the encoded fixation patch.')
+    parser.add_argument('--saliency_source', type=str, default='itti', choices=['events', 'rgb', 'itti'],
+                        help='Saliency method: spiking VM attention on events or RGB, or Itti-Koch-Niebur on RGB.')
     args = parser.parse_args()
+
+    global PATCH_SOURCE, SALIENCY_SOURCE
+    PATCH_SOURCE = args.patch_source
+    SALIENCY_SOURCE = args.saliency_source
+    print(f"Patch source: {PATCH_SOURCE} | Saliency source: {SALIENCY_SOURCE}")
 
     # --- RL: Define state and action dimensions ---
     state_dim = SSP_DIM + (K_SALIENCY * 2) # Memory vector + K coordinates (y,x)
