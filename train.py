@@ -272,8 +272,9 @@ class WorkingMemory:
         print(f"  Working Memory initialized (SSP dim: {ssp_dim})")
 
     def bind(self, a, b):
-        a = np.atleast_2d(a)
-        b = np.atleast_2d(b)
+        # Newer sspspace wraps vectors in an SSP object (array in .v); unwrap for FFT binding
+        a = np.atleast_2d(getattr(a, 'v', a))
+        b = np.atleast_2d(getattr(b, 'v', b))
         return np.fft.ifft(np.fft.fft(a, axis=1) * np.fft.fft(b, axis=1), axis=1).real
 
     def process_saccade(self, image_patch, saccade_center, rotation_state):
